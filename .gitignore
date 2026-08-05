@@ -7,3 +7,8 @@ dist/
 .venv/
 *.db
 *.log
+
+# Binarios grandes de terceros (libmpv, etc.) -- se resuelven en runtime vía
+# core/tools.py o se descargan aparte para empaquetar (spec sección 7), no
+# se versionan: superan el límite de 100MB de GitHub.
+/bin/

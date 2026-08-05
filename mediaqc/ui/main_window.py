@@ -1,16 +1,13 @@
-"""Ventana principal — fase 1: árbol serie/temporada + tabla de episodios.
-
-Las vistas de revisión (mpv), problemas y el semáforo de estados llegan en
-fases posteriores (spec sección 6); esta ventana ya deja la estructura de
-tres zonas (árbol / contenido / barra de estado) sobre la que se construyen.
+"""Ventana principal: árbol serie/temporada a la izquierda, y a la derecha
+las tres vistas de la spec sección 6 (Biblioteca/semáforo, Revisión,
+Problemas) en pestañas, con una barra de estado abajo para el progreso de
+los jobs.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from PySide6.QtCore import QUrl, Qt, QThreadPool
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,8 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -36,24 +32,13 @@ from mediaqc.core import tmdb, tools
 from mediaqc.core.config import Config, ConfigError, get_logs_dir, get_tmdb_cache_dir, save_config
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Series
+from mediaqc.ui.library_view import LibraryView
+from mediaqc.ui.problems_view import ProblemsView
+from mediaqc.ui.review_view import ReviewView
 from mediaqc.ui.settings_dialog import SettingsDialog
 from mediaqc.ui.theme import apply_theme
 from mediaqc.ui.tmdb_dialog import TmdbMatchDialog
 from mediaqc.ui.workers import ScanWorker, TmdbApplyWorker, TmdbSearchWorker, TmdbSyncWorker
-
-TABLE_HEADERS = [
-    "Serie",
-    "Temporada",
-    "#",
-    "Archivo",
-    "Título TMDB",
-    "Audio",
-    "Subtítulos",
-    "Estado",
-    "Duración",
-    "Ausente",
-]
-_DURATION_COL = TABLE_HEADERS.index("Duración")
 
 
 class MainWindow(QMainWindow):
@@ -81,30 +66,40 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         splitter = QSplitter()
 
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Biblioteca"])
-        self.tree.itemSelectionChanged.connect(self._refresh_table)
+        self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
-        splitter.addWidget(self.tree)
+        left_layout.addWidget(self.tree, 1)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-
-        filter_bar = QHBoxLayout()
         self.filter_checkbox = QCheckBox(self._filter_label())
-        self.filter_checkbox.stateChanged.connect(self._refresh_table)
-        filter_bar.addWidget(self.filter_checkbox)
-        filter_bar.addStretch()
-        right_layout.addLayout(filter_bar)
+        self.filter_checkbox.stateChanged.connect(self._on_language_filter_changed)
+        left_layout.addWidget(self.filter_checkbox)
 
-        self.table = QTableWidget(0, len(TABLE_HEADERS))
-        self.table.setHorizontalHeaderLabels(TABLE_HEADERS)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        right_layout.addWidget(self.table)
+        splitter.addWidget(left)
 
-        splitter.addWidget(right)
+        self.view_tabs = QTabWidget()
+        self.library_view = LibraryView(self.session_factory)
+        self.library_view.episode_activated.connect(self._open_review_from_library)
+        self.view_tabs.addTab(self.library_view, "Biblioteca")
+
+        self.review_view = ReviewView(self.session_factory)
+        self.review_view.verdict_recorded.connect(self._on_verdict_recorded)
+        self.review_view.queue_exhausted.connect(self._on_review_queue_exhausted)
+        self.view_tabs.addTab(self.review_view, "Revisión")
+
+        self.problems_view = ProblemsView(self.session_factory)
+        self.problems_view.episode_activated.connect(self._open_review_from_problems)
+        self.view_tabs.addTab(self.problems_view, "Problemas")
+
+        self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
+
+        splitter.addWidget(self.view_tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
@@ -156,6 +151,11 @@ class MainWindow(QMainWindow):
         self.tmdb_sync_action = tmdb_menu.addAction("Sincronizar series nuevas")
         self.tmdb_sync_action.triggered.connect(self._start_tmdb_sync)
 
+        review_menu = self.menuBar().addMenu("&Revisión")
+        start_review_action = review_menu.addAction("Empezar a revisar (selección actual)")
+        start_review_action.setShortcut("Ctrl+R")
+        start_review_action.triggered.connect(self._start_review_from_selection)
+
     def _toggle_dark_mode(self, checked: bool) -> None:
         self.config.dark_mode = checked
         app = QApplication.instance()
@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
                 "Sin ffmpeg/ffprobe el escaneo no puede analizar los archivos.",
             )
 
-    # --- árbol / tabla -------------------------------------------------
+    # --- árbol / navegación entre vistas ---------------------------------
 
     def _reload_tree(self) -> None:
         self.tree.clear()
@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
                     season_item.setData(0, Qt.UserRole, ("season", season.id))
                     series_item.addChild(season_item)
                 self.tree.addTopLevelItem(series_item)
-        self._refresh_table()
+        self._on_tree_selection_changed()
 
     def _on_tree_context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
@@ -227,11 +227,41 @@ class MainWindow(QMainWindow):
             return None
         return items[0].data(0, Qt.UserRole)
 
-    def _refresh_table(self) -> None:
-        scope = self._selected_scope()
-        expected = {lang.lower() for lang in self.config.expected_languages}
-        only_missing = self.filter_checkbox.isChecked()
+    def _on_tree_selection_changed(self) -> None:
+        self.library_view.set_scope(self._selected_scope())
 
+    def _on_language_filter_changed(self) -> None:
+        if self.filter_checkbox.isChecked():
+            expected = {lang.lower() for lang in self.config.expected_languages}
+            self.library_view.set_required_languages(expected)
+        else:
+            self.library_view.set_required_languages(None)
+
+    def _on_view_tab_changed(self, index: int) -> None:
+        widget = self.view_tabs.widget(index)
+        if widget is self.problems_view:
+            self.problems_view.refresh()
+
+    def _open_review_from_library(self, episode_id: int) -> None:
+        self.review_view.load_episode(episode_id, queue=self.library_view.current_episode_ids())
+        self.view_tabs.setCurrentWidget(self.review_view)
+
+    def _open_review_from_problems(self, episode_id: int) -> None:
+        self.review_view.load_episode(episode_id, queue=self.problems_view.current_episode_ids())
+        self.view_tabs.setCurrentWidget(self.review_view)
+
+    def _on_verdict_recorded(self, episode_id: int) -> None:
+        self.library_view.refresh()
+        self.problems_view.refresh()
+
+    def _on_review_queue_exhausted(self) -> None:
+        QMessageBox.information(self, "Revisión", "No hay más episodios en esta cola de revisión.")
+
+    def _start_review_from_selection(self) -> None:
+        """Atajo: abre el primer episodio pendiente de revisión de lo que
+        esté seleccionado en el árbol (o de toda la librería si no hay
+        selección), con el resto de la cola detrás para el atajo Espacio."""
+        scope = self._selected_scope()
         with self.session_factory() as session:
             if scope is None:
                 episodes = repo.list_all_episodes(session)
@@ -240,59 +270,18 @@ class MainWindow(QMainWindow):
             else:
                 episodes = repo.list_episodes_for_season(session, scope[1])
 
-            if only_missing:
-                episodes = [e for e in episodes if not repo.episode_has_audio_language(e, expected)]
-
-            self._populate_table(episodes)
-
-    def _populate_table(self, episodes) -> None:
-        self.table.setRowCount(len(episodes))
-        for row, ep in enumerate(episodes):
-            series_title = "?"
-            season_number = "?"
-            if ep.season is not None:
-                season_number = str(ep.season.number)
-                if ep.season.series is not None:
-                    series_title = ep.season.series.title or ep.season.series.folder_name
-
-            audio_langs = ", ".join(sorted({(t.language or "und") for t in ep.tracks if t.type == "audio"}))
-            sub_labels = sorted(
-                {
-                    (t.language or "und") + (" (forzado)" if t.is_forced else "")
-                    for t in ep.tracks
-                    if t.type == "subtitle"
-                }
-            )
-            duration = f"{ep.duration_s / 60:.1f} min" if ep.duration_s else "—"
-            deviates = repo.episode_runtime_deviates(ep)
-            if deviates:
-                duration += " ⚠"
-
-            values = [
-                series_title,
-                season_number,
-                str(ep.number),
-                Path(ep.path).name,
-                ep.tmdb_title or "—",
-                audio_langs or "—",
-                ", ".join(sub_labels) or "—",
-                ep.status,
-                duration,
-                "sí" if ep.missing else "",
+            pending = [
+                e for e in episodes if e.status in repo.REVIEW_ELIGIBLE_STATUSES and not e.missing
             ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if ep.missing:
-                    item.setForeground(QColor("gray"))
-                elif col == _DURATION_COL and deviates:
-                    item.setForeground(QColor(200, 80, 0))
-                    item.setToolTip(
-                        f"Duración real {ep.duration_s / 60:.1f} min vs. runtime TMDB "
-                        f"{ep.tmdb_runtime_min} min — posible episodio equivocado, versión "
-                        "extendida o archivo truncado."
-                    )
-                self.table.setItem(row, col, item)
-        self.table.resizeColumnsToContents()
+            pending.sort(key=lambda e: ((e.season.number if e.season else 0), e.number))
+            queue = [e.id for e in pending]
+
+        if not queue:
+            QMessageBox.information(self, "Revisión", "No hay episodios pendientes de revisión en esta selección.")
+            return
+
+        self.review_view.load_episode(queue[0], queue=queue)
+        self.view_tabs.setCurrentWidget(self.review_view)
 
     # --- escaneo -------------------------------------------------------
 
@@ -363,6 +352,7 @@ class MainWindow(QMainWindow):
 
         self.status_label.setText(msg)
         self._reload_tree()
+        self.problems_view.refresh()
 
     def _on_scan_error(self, message: str) -> None:
         self._current_worker = None
@@ -516,6 +506,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self.config = dialog.result_config()
             self.filter_checkbox.setText(self._filter_label())
+            self._on_language_filter_changed()
             self.tool_paths = tools.resolve_all(self.config.ffmpeg_path, self.config.mkvmerge_path)
             self._warn_missing_tools()
 
@@ -533,4 +524,5 @@ class MainWindow(QMainWindow):
             self._current_worker.cancel()
         if self._current_tmdb_worker is not None:
             self._current_tmdb_worker.cancel()
+        self.review_view.terminate_player()
         super().closeEvent(event)

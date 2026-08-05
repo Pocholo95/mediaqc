@@ -11,6 +11,7 @@ Nunca se invoca nada con ``shell=True``.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -73,6 +74,32 @@ class ToolPaths:
         if self.mkvmerge is None:
             missing.append("mkvmerge")
         return missing
+
+
+_mpv_dll_setup_done = False
+
+
+def ensure_mpv_loadable() -> None:
+    """Deja ``bin/`` disponible para que ``import mpv`` (ctypes) encuentre
+    ``libmpv-2.dll``/``mpv-2.dll`` en Windows.
+
+    ``libmpv-2.dll`` no se versiona en el repo (pesa ~110MB, supera el
+    límite de GitHub) — hay que colocarlo en ``bin/`` a mano en desarrollo,
+    o empaquetarlo ahí para distribución (spec sección 7). Tiene que
+    llamarse ANTES de cualquier ``import mpv`` en el proceso: ctypes
+    resuelve la DLL en el momento del import, no lazily.
+    """
+    global _mpv_dll_setup_done
+    if _mpv_dll_setup_done:
+        return
+    _mpv_dll_setup_done = True
+
+    bundled = _bundled_bin_dir()
+    if not bundled.is_dir():
+        return
+    if hasattr(os, "add_dll_directory"):  # Windows únicamente
+        os.add_dll_directory(str(bundled))
+    os.environ["PATH"] = str(bundled) + os.pathsep + os.environ.get("PATH", "")
 
 
 def resolve_all(ffmpeg_override: str | None = None, mkvmerge_override: str | None = None) -> ToolPaths:

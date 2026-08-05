@@ -13,9 +13,41 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
-from mediaqc.core.db.models import Analysis, Base, Episode, Job, Season, Series, Track
+from mediaqc.core.db.models import Analysis, Base, Episode, Job, Review, Season, Series, Track
 from mediaqc.core.probe import ProbeResult
 from mediaqc.core.scanner import ScannedEpisode, ScanResult
+
+# Vocabulario cerrado de veredictos (spec sección 4). "otro" exige nota
+# obligatoria -- lo hace cumplir la UI, no este módulo.
+VALID_VERDICTS = {
+    "ok",
+    "sync_constante",
+    "sync_drift",
+    "sync_segmentado",
+    "audio_faltante",
+    "audio_incompleto",
+    "subs_faltantes",
+    "episodio_equivocado",
+    "calidad_audio",
+    "pista_duplicada",
+    "otro",
+}
+
+# "analizado": recién probado, todavía no pasó por el analizador de audio
+# (fase 4, no existe todavía). "pendiente_revision": ya tiene un veredicto
+# automático esperando confirmación humana. Sin analizador, ambos significan
+# lo mismo para el semáforo y la cola de revisión: "listo para que lo mire
+# un humano".
+REVIEW_ELIGIBLE_STATUSES = {"analizado", "pendiente_revision"}
+
+SEMAPHORE_COLORS = {
+    "sin_analizar": "gray",
+    "analizado": "amber",
+    "pendiente_revision": "amber",
+    "aprobado": "green",
+    "problema": "red",
+    "corregido": "blue",
+}
 
 
 def create_db_engine(db_path: Path) -> Engine:
@@ -312,6 +344,64 @@ def list_series_pending_manual_tmdb(session: Session) -> list[Series]:
         .order_by(Series.folder_name)
     )
     return list(session.execute(stmt).scalars().all())
+
+
+# --- reviews / estados -------------------------------------------------------
+
+
+def record_review(
+    session: Session,
+    episode: Episode,
+    verdict: str,
+    timestamp_ms: int | None = None,
+    note: str | None = None,
+) -> Review:
+    """Agrega una fila a ``reviews`` (append-only, es el historial) y mueve el
+    estado del episodio. ``ok`` aprueba; cualquier otro veredicto es un
+    problema a resolver (spec sección 4). El analizador automático nunca
+    otorga ``aprobado`` — solo una review humana lo hace (trampa #10)."""
+    if verdict not in VALID_VERDICTS:
+        raise ValueError(f"veredicto desconocido: {verdict}")
+
+    review = Review(episode_id=episode.id, verdict=verdict, timestamp_ms=timestamp_ms, note=note)
+    session.add(review)
+    episode.status = "aprobado" if verdict == "ok" else "problema"
+    return review
+
+
+def list_episode_reviews(session: Session, episode_id: int) -> list[Review]:
+    stmt = select(Review).where(Review.episode_id == episode_id).order_by(Review.created_at.desc())
+    return list(session.execute(stmt).scalars().all())
+
+
+def list_review_queue(session: Session, season_id: int | None = None) -> list[Episode]:
+    """Episodios listos para que un humano los revise (Vista 2)."""
+    stmt = (
+        select(Episode)
+        .where(Episode.status.in_(REVIEW_ELIGIBLE_STATUSES), Episode.missing.is_(False))
+        .options(
+            selectinload(Episode.tracks),
+            selectinload(Episode.season).selectinload(Season.series),
+        )
+        .order_by(Episode.number)
+    )
+    if season_id is not None:
+        stmt = stmt.where(Episode.season_id == season_id)
+    return list(session.execute(stmt).unique().scalars().all())
+
+
+def list_problem_episodes(session: Session) -> list[Episode]:
+    """Vista 3: lista plana de todo lo que está en ``problema``."""
+    stmt = (
+        select(Episode)
+        .where(Episode.status == "problema")
+        .options(
+            selectinload(Episode.season).selectinload(Season.series),
+            selectinload(Episode.reviews),
+        )
+        .order_by(Episode.number)
+    )
+    return list(session.execute(stmt).unique().scalars().all())
 
 
 # --- jobs -----------------------------------------------------------------------

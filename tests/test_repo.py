@@ -1,12 +1,19 @@
 from types import SimpleNamespace
 
+import pytest
+
 from mediaqc.core.db.repo import (
     apply_scan_result,
     create_db_engine,
     episode_runtime_deviates,
+    list_episode_reviews,
+    list_problem_episodes,
+    list_review_queue,
     list_series_tree,
     make_session_factory,
+    record_review,
 )
+from mediaqc.core.db.models import Episode, Season, Series
 from mediaqc.core.scanner import ScannedEpisode, ScannedSeries, ScanResult
 
 
@@ -102,3 +109,104 @@ def test_rescan_reparents_episodes_and_cleans_up_ghost_series(tmp_path):
     (series,) = series_after
     seasons = {season.number for season in series.seasons}
     assert seasons == {1, 2}
+
+
+def _seed_one_episode(tmp_path, status: str = "analizado", missing: bool = False) -> tuple[object, int]:
+    engine = create_db_engine(tmp_path / "mediaqc.db")
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        series = Series(path="X", folder_name="Serie")
+        season = Season(number=1)
+        episode = Episode(number=1, path="ep1.mkv", status=status, missing=missing)
+        season.episodes.append(episode)
+        series.seasons.append(season)
+        session.add(series)
+        session.commit()
+        episode_id = episode.id
+    return session_factory, episode_id
+
+
+def test_record_review_ok_approves_episode(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path)
+    with session_factory() as session:
+        episode = session.get(Episode, episode_id)
+        record_review(session, episode, "ok")
+        session.commit()
+        assert episode.status == "aprobado"
+
+
+def test_record_review_non_ok_marks_problema(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path)
+    with session_factory() as session:
+        episode = session.get(Episode, episode_id)
+        record_review(session, episode, "sync_constante")
+        session.commit()
+        assert episode.status == "problema"
+
+
+def test_record_review_rejects_unknown_verdict(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path)
+    with session_factory() as session:
+        episode = session.get(Episode, episode_id)
+        with pytest.raises(ValueError):
+            record_review(session, episode, "veredicto_inventado")
+
+
+def test_record_review_persists_timestamp_and_note(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path)
+    with session_factory() as session:
+        episode = session.get(Episode, episode_id)
+        record_review(session, episode, "otro", timestamp_ms=12345, note="se corta el audio")
+        session.commit()
+
+    with session_factory() as session:
+        reviews = list_episode_reviews(session, episode_id)
+        assert len(reviews) == 1
+        assert reviews[0].timestamp_ms == 12345
+        assert reviews[0].note == "se corta el audio"
+
+
+def test_list_episode_reviews_is_append_only_history(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path)
+    with session_factory() as session:
+        episode = session.get(Episode, episode_id)
+        record_review(session, episode, "sync_constante")
+        record_review(session, episode, "ok")
+        session.commit()
+
+    with session_factory() as session:
+        reviews = list_episode_reviews(session, episode_id)
+        assert len(reviews) == 2  # ambas quedan, nada se pisa ni se borra
+
+
+def test_list_review_queue_includes_analizado_and_pendiente_revision(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path, status="analizado")
+    with session_factory() as session:
+        queue = list_review_queue(session)
+        assert [e.id for e in queue] == [episode_id]
+
+
+def test_list_review_queue_excludes_missing_episodes(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path, status="analizado", missing=True)
+    with session_factory() as session:
+        queue = list_review_queue(session)
+        assert queue == []
+
+
+def test_list_review_queue_excludes_already_reviewed(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path, status="aprobado")
+    with session_factory() as session:
+        queue = list_review_queue(session)
+        assert queue == []
+
+
+def test_list_problem_episodes_only_problema_status(tmp_path):
+    session_factory, episode_id = _seed_one_episode(tmp_path, status="analizado")
+    with session_factory() as session:
+        episode = session.get(Episode, episode_id)
+        record_review(session, episode, "audio_faltante")
+        session.commit()
+
+    with session_factory() as session:
+        problems = list_problem_episodes(session)
+        assert [e.id for e in problems] == [episode_id]
