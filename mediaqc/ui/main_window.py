@@ -488,8 +488,25 @@ class MainWindow(QMainWindow):
 
     def _run_tmdb_search(self, dialog: TmdbMatchDialog, query: str, year: int | None) -> None:
         worker = TmdbSearchWorker(self._make_tmdb_client, query, year)
-        worker.signals.finished.connect(lambda payload: dialog.set_results(payload.get("results", [])))
-        worker.signals.error.connect(dialog.set_error)
+
+        def _on_finished(payload: dict) -> None:
+            # el diálogo puede haberse cerrado (o esta puede ser una búsqueda
+            # vieja superada por una más nueva) antes de que la respuesta
+            # llegue: tocar un widget ya destruido tira RuntimeError en vez
+            # de crashear, pero igual no hay nada útil que actualizar.
+            try:
+                dialog.set_results(payload.get("results", []))
+            except RuntimeError:
+                pass
+
+        def _on_error(message: str) -> None:
+            try:
+                dialog.set_error(message)
+            except RuntimeError:
+                pass
+
+        worker.signals.finished.connect(_on_finished)
+        worker.signals.error.connect(_on_error)
         self.thread_pool.start(worker)
 
     # --- preferencias / jobs pendientes --------------------------------

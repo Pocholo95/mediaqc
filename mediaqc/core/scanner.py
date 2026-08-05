@@ -24,6 +24,10 @@ _RE_SEASON_FOLDER = re.compile(r"(?:season|temporada)\s*0*(\d{1,3})", re.IGNOREC
 # ("Serie.S01.01.Titulo.mkv"), y la spec pide manejarlos (sección 9).
 _RE_BARE_NUMBER = re.compile(r"(?:^|[ \-_.])0*(\d{1,3})(?:[ \-_.]|$)")
 _RE_SERIES_YEAR = re.compile(r"^(.*?)\s*\((\d{4})\)\s*$")
+# Tags de scraper estilo Jellyfin/Kodi/Emby pegados al nombre de carpeta:
+# "Serie (2019) [tmdbid-88046]", "Serie (2019) {tmdb-88046}", "[imdbid-tt123]".
+_RE_SCRAPER_TAG = re.compile(r"[\[\{][^\[\]\{\}]*[\]\}]")
+_RE_TMDB_ID_HINT = re.compile(r"tmdb(?:id)?-(\d+)", re.IGNORECASE)
 
 
 def parse_filename_sxxexx(name: str) -> tuple[int, int] | None:
@@ -55,12 +59,32 @@ def parse_filename_bare_number(name: str) -> int | None:
     return int(m.group(1))
 
 
+def strip_scraper_tags(name: str) -> str:
+    """Saca sufijos de metadata tipo ``[tmdbid-88046]``/``{tmdb-88046}``/
+    ``[imdbid-tt123]`` que Jellyfin/Kodi/Emby agregan al nombre de carpeta.
+    Sin esto, esos tags terminan pegados al título y ensucian tanto el año
+    parseado como la búsqueda en TMDB."""
+    cleaned = _RE_SCRAPER_TAG.sub("", name).strip()
+    return cleaned or name.strip()
+
+
+def parse_tmdb_id_hint(name: str) -> int | None:
+    """El propio nombre de carpeta a veces ya trae el tmdb id (convención
+    Jellyfin/Kodi). Si está, es una señal mucho más confiable que buscar por
+    título — se usa para saltear la búsqueda difusa por completo."""
+    m = _RE_TMDB_ID_HINT.search(name)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
 def parse_series_folder(name: str) -> tuple[str, int | None]:
     """``"Nombre (2005)"`` -> ``("Nombre", 2005)``. Sin año, el nombre tal cual."""
-    m = _RE_SERIES_YEAR.match(name)
+    cleaned = strip_scraper_tags(name)
+    m = _RE_SERIES_YEAR.match(cleaned)
     if m:
         return m.group(1).strip(), int(m.group(2))
-    return name.strip(), None
+    return cleaned.strip(), None
 
 
 def parse_episode(path: Path, series_root: Path) -> tuple[int, int] | None:

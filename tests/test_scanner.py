@@ -7,7 +7,9 @@ from mediaqc.core.scanner import (
     parse_filename_sxxexx,
     parse_season_folder,
     parse_series_folder,
+    parse_tmdb_id_hint,
     scan_media_paths,
+    strip_scraper_tags,
 )
 
 
@@ -17,6 +19,38 @@ def test_parse_series_folder_with_year():
 
 def test_parse_series_folder_without_year():
     assert parse_series_folder("Serie Sin Año") == ("Serie Sin Año", None)
+
+
+def test_parse_series_folder_strips_tmdbid_tag():
+    # Convención Jellyfin/Kodi: el tag va después del año y ensucia tanto el
+    # año parseado como la búsqueda en TMDB si no se saca.
+    assert parse_series_folder("Fire Force (2019) [tmdbid-88046]") == ("Fire Force", 2019)
+
+
+def test_parse_series_folder_strips_tag_without_year():
+    assert parse_series_folder("Fire Force [tmdbid-88046]") == ("Fire Force", None)
+
+
+def test_strip_scraper_tags_removes_bracketed_and_braced():
+    assert strip_scraper_tags("Serie (2019) [tmdbid-88046]") == "Serie (2019)"
+    assert strip_scraper_tags("Serie (2019) {tmdb-88046}") == "Serie (2019)"
+    assert strip_scraper_tags("Serie [imdbid-tt1234567]") == "Serie"
+
+
+def test_strip_scraper_tags_no_tag_unchanged():
+    assert strip_scraper_tags("Serie Normal") == "Serie Normal"
+
+
+def test_parse_tmdb_id_hint_found():
+    assert parse_tmdb_id_hint("Fire Force (2019) [tmdbid-88046]") == 88046
+
+
+def test_parse_tmdb_id_hint_tmdb_without_id_suffix():
+    assert parse_tmdb_id_hint("Serie {tmdb-12345}") == 12345
+
+
+def test_parse_tmdb_id_hint_absent():
+    assert parse_tmdb_id_hint("Serie Sin Tag (2019)") is None
 
 
 def test_parse_season_folder_season():

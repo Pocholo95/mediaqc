@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Series
+from mediaqc.core.scanner import parse_tmdb_id_hint
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,19 @@ def sync_new_series(session: Session, client: TmdbClient, series: Series) -> str
     """
     if not client.enabled:
         return series.tmdb_status or "unmatched"
+
+    hint = parse_tmdb_id_hint(series.folder_name)
+    if hint is not None:
+        try:
+            apply_series_match(session, client, series, hint, status="auto")
+            return "auto"
+        except TmdbError as exc:
+            logger.warning(
+                "el tmdb id %s del nombre de carpeta '%s' no funcionó (%s), cae a búsqueda por título",
+                hint,
+                series.folder_name,
+                exc,
+            )
 
     query = series.title or series.folder_name
     results = client.search_tv(query, series.year)
