@@ -36,3 +36,33 @@ def apply_light_palette(app: QApplication) -> None:
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(150, 150, 150))
 
     app.setPalette(palette)
+
+
+def apply_dark_palette(app: QApplication) -> None:
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(230, 230, 230))
+    palette.setColor(QPalette.ColorRole.Base, QColor(30, 30, 30))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(45, 45, 45))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(230, 230, 230))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(20, 20, 20))
+    palette.setColor(QPalette.ColorRole.Text, QColor(230, 230, 230))
+    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(230, 230, 230))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 80, 80))
+    palette.setColor(QPalette.ColorRole.Link, QColor(100, 170, 255))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(20, 20, 20))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(140, 140, 140))
+
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(110, 110, 110))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(110, 110, 110))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(110, 110, 110))
+
+    app.setPalette(palette)
+
+
+def apply_theme(app: QApplication, dark: bool) -> None:
+    apply_dark_palette(app) if dark else apply_light_palette(app)

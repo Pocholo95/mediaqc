@@ -12,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QUrl, Qt, QThreadPool
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QHBoxLayout,
@@ -31,12 +32,13 @@ from PySide6.QtWidgets import (
 )
 
 from mediaqc.core import tools
-from mediaqc.core.config import Config, get_logs_dir
+from mediaqc.core.config import Config, ConfigError, get_logs_dir, save_config
 from mediaqc.core.db import repo
 from mediaqc.ui.settings_dialog import SettingsDialog
+from mediaqc.ui.theme import apply_theme
 from mediaqc.ui.workers import ScanWorker
 
-TABLE_HEADERS = ["Serie", "Temporada", "#", "Archivo", "Audio", "Estado", "Duración", "Ausente"]
+TABLE_HEADERS = ["Serie", "Temporada", "#", "Archivo", "Audio", "Subtítulos", "Estado", "Duración", "Ausente"]
 
 
 class MainWindow(QMainWindow):
@@ -126,6 +128,22 @@ class MainWindow(QMainWindow):
         exit_action = menu.addAction("Salir")
         exit_action.triggered.connect(self.close)
 
+        view_menu = self.menuBar().addMenu("&Ver")
+        self.dark_mode_action = view_menu.addAction("Modo oscuro")
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setChecked(self.config.dark_mode)
+        self.dark_mode_action.toggled.connect(self._toggle_dark_mode)
+
+    def _toggle_dark_mode(self, checked: bool) -> None:
+        self.config.dark_mode = checked
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app, dark=checked)
+        try:
+            save_config(self.config)
+        except ConfigError:
+            pass  # output_dir/media_paths no cambiaron acá, no debería pasar
+
     def _open_logs_dir(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_logs_dir())))
 
@@ -194,6 +212,13 @@ class MainWindow(QMainWindow):
                     series_title = ep.season.series.title or ep.season.series.folder_name
 
             audio_langs = ", ".join(sorted({(t.language or "und") for t in ep.tracks if t.type == "audio"}))
+            sub_labels = sorted(
+                {
+                    (t.language or "und") + (" (forzado)" if t.is_forced else "")
+                    for t in ep.tracks
+                    if t.type == "subtitle"
+                }
+            )
             duration = f"{ep.duration_s / 60:.1f} min" if ep.duration_s else "—"
 
             values = [
@@ -202,6 +227,7 @@ class MainWindow(QMainWindow):
                 str(ep.number),
                 Path(ep.path).name,
                 audio_langs or "—",
+                ", ".join(sub_labels) or "—",
                 ep.status,
                 duration,
                 "sí" if ep.missing else "",

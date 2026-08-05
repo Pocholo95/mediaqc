@@ -36,6 +36,7 @@ class Config:
     audio_cache_limit_gb: float = 5
     ffmpeg_path: str | None = None
     mkvmerge_path: str | None = None
+    dark_mode: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

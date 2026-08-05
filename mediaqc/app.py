@@ -12,7 +12,7 @@ from mediaqc.core import config, tools
 from mediaqc.core.db import repo
 from mediaqc.ui.main_window import MainWindow
 from mediaqc.ui.settings_dialog import FirstRunWizard
-from mediaqc.ui.theme import apply_light_palette
+from mediaqc.ui.theme import apply_theme
 
 
 def _setup_logging() -> None:
@@ -30,7 +30,7 @@ def _setup_logging() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
-    apply_light_palette(app)
+    apply_theme(app, dark=False)
     _setup_logging()
     logger = logging.getLogger(__name__)
     logger.info("MediaQC arrancando")
@@ -49,6 +49,8 @@ def main() -> int:
         except config.ConfigError as exc:
             QMessageBox.critical(None, "Configuración inválida", str(exc))
             return 1
+
+    apply_theme(app, dark=cfg.dark_mode)
 
     engine = repo.create_db_engine(config.get_db_path())
     session_factory = repo.make_session_factory(engine)

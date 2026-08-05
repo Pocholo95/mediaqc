@@ -1,6 +1,19 @@
 import pytest
 
-from mediaqc.core.config import ConfigError, validate_output_dir
+from mediaqc.core.config import Config, ConfigError, validate_output_dir
+
+
+def test_config_from_dict_defaults_dark_mode_false():
+    assert Config.from_dict({}).dark_mode is False
+
+
+def test_config_from_dict_reads_dark_mode():
+    assert Config.from_dict({"dark_mode": True}).dark_mode is True
+
+
+def test_config_from_dict_ignores_unknown_keys():
+    cfg = Config.from_dict({"dark_mode": True, "algo_futuro": 123})
+    assert cfg.dark_mode is True
 
 
 def test_output_dir_inside_media_path_raises(tmp_path):
