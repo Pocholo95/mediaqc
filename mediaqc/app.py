@@ -12,6 +12,7 @@ from mediaqc.core import config, tools
 from mediaqc.core.db import repo
 from mediaqc.ui.main_window import MainWindow
 from mediaqc.ui.settings_dialog import FirstRunWizard
+from mediaqc.ui.theme import apply_light_palette
 
 
 def _setup_logging() -> None:
@@ -29,6 +30,7 @@ def _setup_logging() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    apply_light_palette(app)
     _setup_logging()
     logger = logging.getLogger(__name__)
     logger.info("MediaQC arrancando")

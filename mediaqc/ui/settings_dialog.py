@@ -175,6 +175,9 @@ class FirstRunWizard(QWizard):
         super().__init__(parent)
         self.setWindowTitle("Bienvenido a MediaQC")
         self.setOption(QWizard.NoBackButtonOnStartPage, True)
+        # WizardStyle por defecto en Windows ("Aero") rompe el contraste con
+        # el modo oscuro del sistema; ModernStyle respeta la paleta de la app.
+        self.setWizardStyle(QWizard.ModernStyle)
 
         self._media_page, self.media_paths_list = self._make_path_page(
             "Carpetas de la librería",
