@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -31,14 +32,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mediaqc.core import tools
-from mediaqc.core.config import Config, ConfigError, get_logs_dir, save_config
+from mediaqc.core import tmdb, tools
+from mediaqc.core.config import Config, ConfigError, get_logs_dir, get_tmdb_cache_dir, save_config
 from mediaqc.core.db import repo
+from mediaqc.core.db.models import Series
 from mediaqc.ui.settings_dialog import SettingsDialog
 from mediaqc.ui.theme import apply_theme
-from mediaqc.ui.workers import ScanWorker
+from mediaqc.ui.tmdb_dialog import TmdbMatchDialog
+from mediaqc.ui.workers import ScanWorker, TmdbApplyWorker, TmdbSearchWorker, TmdbSyncWorker
 
-TABLE_HEADERS = ["Serie", "Temporada", "#", "Archivo", "Audio", "Subtítulos", "Estado", "Duración", "Ausente"]
+TABLE_HEADERS = [
+    "Serie",
+    "Temporada",
+    "#",
+    "Archivo",
+    "Título TMDB",
+    "Audio",
+    "Subtítulos",
+    "Estado",
+    "Duración",
+    "Ausente",
+]
+_DURATION_COL = TABLE_HEADERS.index("Duración")
 
 
 class MainWindow(QMainWindow):
@@ -49,6 +64,7 @@ class MainWindow(QMainWindow):
         self.tool_paths = tool_paths
         self.thread_pool = QThreadPool.globalInstance()
         self._current_worker: ScanWorker | None = None
+        self._current_tmdb_worker: TmdbSyncWorker | None = None
         self._last_unparseable: list[str] = []
 
         self.setWindowTitle("MediaQC")
@@ -68,6 +84,8 @@ class MainWindow(QMainWindow):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Biblioteca"])
         self.tree.itemSelectionChanged.connect(self._refresh_table)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         splitter.addWidget(self.tree)
 
         right = QWidget()
@@ -98,7 +116,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.cancel_button = QPushButton("Cancelar")
         self.cancel_button.setVisible(False)
-        self.cancel_button.clicked.connect(self._cancel_scan)
+        self.cancel_button.clicked.connect(self._cancel_current_worker)
         status.addWidget(self.status_label, 1)
         status.addWidget(self.progress_bar)
         status.addWidget(self.cancel_button)
@@ -134,6 +152,10 @@ class MainWindow(QMainWindow):
         self.dark_mode_action.setChecked(self.config.dark_mode)
         self.dark_mode_action.toggled.connect(self._toggle_dark_mode)
 
+        tmdb_menu = self.menuBar().addMenu("&TMDB")
+        self.tmdb_sync_action = tmdb_menu.addAction("Sincronizar series nuevas")
+        self.tmdb_sync_action.triggered.connect(self._start_tmdb_sync)
+
     def _toggle_dark_mode(self, checked: bool) -> None:
         self.config.dark_mode = checked
         app = QApplication.instance()
@@ -168,14 +190,36 @@ class MainWindow(QMainWindow):
                 label = series.title or series.folder_name
                 if series.year:
                     label += f" ({series.year})"
+                if series.tmdb_status in (None, "unmatched"):
+                    label += " — sin TMDB"
+                elif series.tmdb_status == "skipped":
+                    label += " — TMDB omitido"
                 series_item = QTreeWidgetItem([label])
                 series_item.setData(0, Qt.UserRole, ("series", series.id))
                 for season in series.seasons:
-                    season_item = QTreeWidgetItem([f"Temporada {season.number}"])
+                    season_label = f"Temporada {season.number}"
+                    on_disk = sum(1 for e in season.episodes if not e.missing)
+                    if season.tmdb_episode_count:
+                        season_label += f" ({on_disk}/{season.tmdb_episode_count})"
+                        if on_disk < season.tmdb_episode_count:
+                            season_label += " — incompleta"
+                    season_item = QTreeWidgetItem([season_label])
                     season_item.setData(0, Qt.UserRole, ("season", season.id))
                     series_item.addChild(season_item)
                 self.tree.addTopLevelItem(series_item)
         self._refresh_table()
+
+    def _on_tree_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        scope = item.data(0, Qt.UserRole)
+        if scope is None or scope[0] != "series":
+            return
+        menu = QMenu(self)
+        action = menu.addAction("Resolver TMDB...")
+        action.triggered.connect(lambda: self._resolve_tmdb_for_series(scope[1]))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _selected_scope(self) -> tuple[str, int] | None:
         items = self.tree.selectedItems()
@@ -220,12 +264,16 @@ class MainWindow(QMainWindow):
                 }
             )
             duration = f"{ep.duration_s / 60:.1f} min" if ep.duration_s else "—"
+            deviates = repo.episode_runtime_deviates(ep)
+            if deviates:
+                duration += " ⚠"
 
             values = [
                 series_title,
                 season_number,
                 str(ep.number),
                 Path(ep.path).name,
+                ep.tmdb_title or "—",
                 audio_langs or "—",
                 ", ".join(sub_labels) or "—",
                 ep.status,
@@ -236,6 +284,13 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if ep.missing:
                     item.setForeground(QColor("gray"))
+                elif col == _DURATION_COL and deviates:
+                    item.setForeground(QColor(200, 80, 0))
+                    item.setToolTip(
+                        f"Duración real {ep.duration_s / 60:.1f} min vs. runtime TMDB "
+                        f"{ep.tmdb_runtime_min} min — posible episodio equivocado, versión "
+                        "extendida o archivo truncado."
+                    )
                 self.table.setItem(row, col, item)
         self.table.resizeColumnsToContents()
 
@@ -271,10 +326,12 @@ class MainWindow(QMainWindow):
 
         self.thread_pool.start(worker)
 
-    def _cancel_scan(self) -> None:
+    def _cancel_current_worker(self) -> None:
         if self._current_worker is not None:
             self._current_worker.cancel()
-            self.status_label.setText("Cancelando...")
+        if self._current_tmdb_worker is not None:
+            self._current_tmdb_worker.cancel()
+        self.status_label.setText("Cancelando...")
 
     def _on_scan_progress(self, message: str, current: int, total: int) -> None:
         self.status_label.setText(message)
@@ -323,6 +380,116 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "Archivos no reconocidos", "\n".join(self._last_unparseable))
 
+    # --- TMDB ------------------------------------------------------------
+
+    def _make_tmdb_client(self) -> tmdb.TmdbClient:
+        return tmdb.TmdbClient(self.config.tmdb_api_key, self.config.tmdb_language, get_tmdb_cache_dir())
+
+    def _start_tmdb_sync(self) -> None:
+        if not self.config.tmdb_api_key:
+            QMessageBox.information(
+                self,
+                "TMDB no configurado",
+                "Configurá una API key de TMDB en Preferencias para traer metadatos.",
+            )
+            return
+        if self._current_tmdb_worker is not None:
+            return
+
+        worker = TmdbSyncWorker(self.session_factory, self._make_tmdb_client)
+        worker.signals.progress.connect(self._on_scan_progress)
+        worker.signals.finished.connect(self._on_tmdb_sync_finished)
+        worker.signals.error.connect(self._on_tmdb_error)
+        self._current_tmdb_worker = worker
+
+        self.tmdb_sync_action.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.cancel_button.setVisible(True)
+        self.status_label.setText("Sincronizando TMDB...")
+
+        self.thread_pool.start(worker)
+
+    def _on_tmdb_sync_finished(self, summary: dict) -> None:
+        self._current_tmdb_worker = None
+        self.tmdb_sync_action.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+
+        if summary.get("total", 0) == 0:
+            self.status_label.setText("TMDB: no había series nuevas para sincronizar.")
+        else:
+            msg = (
+                f"TMDB: {summary['auto']} coincidencias automáticas, "
+                f"{summary['unmatched']} necesitan revisión manual (click derecho en el árbol)."
+            )
+            if summary.get("errors"):
+                msg += f" {summary['errors']} errores."
+            self.status_label.setText(msg)
+
+        self._reload_tree()
+
+    def _on_tmdb_error(self, message: str) -> None:
+        self._current_tmdb_worker = None
+        self.tmdb_sync_action.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.status_label.setText("Error de TMDB.")
+        QMessageBox.critical(self, "Error de TMDB", message)
+
+    def _resolve_tmdb_for_series(self, series_id: int) -> None:
+        if not self.config.tmdb_api_key:
+            QMessageBox.information(
+                self,
+                "TMDB no configurado",
+                "Configurá una API key de TMDB en Preferencias para buscar coincidencias.",
+            )
+            return
+
+        with self.session_factory() as session:
+            series = session.get(Series, series_id)
+            if series is None:
+                return
+            folder_name = series.folder_name
+            query = series.title or series.folder_name
+            year = series.year
+
+        dialog = TmdbMatchDialog(folder_name, query, year, self)
+        dialog.search_requested.connect(lambda q, y: self._run_tmdb_search(dialog, q, y))
+        self._run_tmdb_search(dialog, query, year)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        if dialog.was_skipped():
+            with self.session_factory() as session:
+                series = session.get(Series, series_id)
+                if series is not None:
+                    repo.mark_series_tmdb_status(session, series, "skipped")
+                    session.commit()
+            self._reload_tree()
+            return
+
+        tmdb_id = dialog.selected_tmdb_id()
+        if tmdb_id is None:
+            return
+
+        worker = TmdbApplyWorker(self.session_factory, self._make_tmdb_client, series_id, tmdb_id, status="manual")
+        worker.signals.finished.connect(lambda _: self._on_tmdb_apply_finished())
+        worker.signals.error.connect(lambda msg: QMessageBox.warning(self, "Error de TMDB", msg))
+        self.status_label.setText("Aplicando coincidencia de TMDB...")
+        self.thread_pool.start(worker)
+
+    def _on_tmdb_apply_finished(self) -> None:
+        self.status_label.setText("Metadatos de TMDB actualizados.")
+        self._reload_tree()
+
+    def _run_tmdb_search(self, dialog: TmdbMatchDialog, query: str, year: int | None) -> None:
+        worker = TmdbSearchWorker(self._make_tmdb_client, query, year)
+        worker.signals.finished.connect(lambda payload: dialog.set_results(payload.get("results", [])))
+        worker.signals.error.connect(dialog.set_error)
+        self.thread_pool.start(worker)
+
     # --- preferencias / jobs pendientes --------------------------------
 
     def _open_settings(self) -> None:
@@ -345,4 +512,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (override de Qt)
         if self._current_worker is not None:
             self._current_worker.cancel()
+        if self._current_tmdb_worker is not None:
+            self._current_tmdb_worker.cancel()
         super().closeEvent(event)

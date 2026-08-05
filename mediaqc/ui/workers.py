@@ -13,9 +13,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
-from mediaqc.core import probe, scanner
+from mediaqc.core import probe, scanner, tmdb
 from mediaqc.core.db import repo
-from mediaqc.core.db.models import Episode, Job
+from mediaqc.core.db.models import Episode, Job, Series
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +138,131 @@ class ScanWorker(QRunnable):
                 repo.update_job(session, job, state="failed", message=str(exc))
                 session.commit()
             raise
+
+
+class TmdbSyncWorker(QRunnable):
+    """Pasada masiva: busca match para toda serie que todavía no lo tiene."""
+
+    def __init__(self, session_factory, client_factory) -> None:
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.session_factory = session_factory
+        self.client_factory = client_factory
+        self._cancel_event = threading.Event()
+        self.setAutoDelete(True)
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as exc:
+            logger.exception("tmdb sync worker failed")
+            self.signals.error.emit(str(exc))
+
+    def _run(self) -> None:
+        with self.session_factory() as session:
+            series_ids = [s.id for s in repo.list_series_needing_tmdb_sync(session)]
+
+        total = len(series_ids)
+        if total == 0:
+            self.signals.finished.emit({"auto": 0, "unmatched": 0, "errors": 0, "total": 0})
+            return
+
+        auto = unmatched = errors = 0
+        with self.client_factory() as client:
+            if not client.enabled:
+                self.signals.error.emit(
+                    "No hay API key de TMDB configurada. Configurala en Preferencias para traer metadatos."
+                )
+                return
+
+            for i, series_id in enumerate(series_ids, start=1):
+                if self._cancel_event.is_set():
+                    break
+                with self.session_factory() as session:
+                    series = session.get(Series, series_id)
+                    if series is None:
+                        continue
+                    self.signals.progress.emit(f"TMDB: {series.folder_name}", i, total)
+                    try:
+                        status = tmdb.sync_new_series(session, client, series)
+                        session.commit()
+                    except tmdb.TmdbError as exc:
+                        errors += 1
+                        logger.warning("tmdb sync failed for %s: %s", series.folder_name, exc)
+                        session.rollback()
+                        continue
+                    if status == "auto":
+                        auto += 1
+                    else:
+                        unmatched += 1
+
+        self.signals.finished.emit(
+            {"auto": auto, "unmatched": unmatched, "errors": errors, "total": total}
+        )
+
+
+class TmdbSearchWorker(QRunnable):
+    """Búsqueda puntual de una serie en TMDB, con pósters ya descargados."""
+
+    def __init__(self, client_factory, query: str, year: int | None) -> None:
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.client_factory = client_factory
+        self.query = query
+        self.year = year
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            with self.client_factory() as client:
+                if not client.enabled:
+                    self.signals.error.emit("No hay API key de TMDB configurada.")
+                    return
+                results = client.search_tv(self.query, self.year)
+                payload = []
+                for r in results[:12]:
+                    poster = client.download_poster(r.poster_path)
+                    payload.append(
+                        {
+                            "tmdb_id": r.tmdb_id,
+                            "name": r.name,
+                            "year": r.first_air_year,
+                            "poster_local_path": str(poster) if poster else None,
+                        }
+                    )
+            self.signals.finished.emit({"results": payload})
+        except Exception as exc:
+            logger.exception("tmdb search worker failed")
+            self.signals.error.emit(str(exc))
+
+
+class TmdbApplyWorker(QRunnable):
+    """Aplica un tmdb_id elegido (a mano o automático) a una serie puntual."""
+
+    def __init__(self, session_factory, client_factory, series_id: int, tmdb_id: int, status: str) -> None:
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.session_factory = session_factory
+        self.client_factory = client_factory
+        self.series_id = series_id
+        self.tmdb_id = tmdb_id
+        self.status = status
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            with self.client_factory() as client:
+                with self.session_factory() as session:
+                    series = session.get(Series, self.series_id)
+                    if series is None:
+                        self.signals.error.emit("La serie ya no existe en la base de datos.")
+                        return
+                    tmdb.apply_series_match(session, client, series, self.tmdb_id, status=self.status)
+                    session.commit()
+            self.signals.finished.emit({"series_id": self.series_id})
+        except Exception as exc:
+            logger.exception("tmdb apply worker failed")
+            self.signals.error.emit(str(exc))

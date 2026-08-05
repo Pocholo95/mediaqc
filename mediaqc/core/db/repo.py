@@ -184,7 +184,11 @@ def save_probe_result(session: Session, episode: Episode, probe_result: ProbeRes
 
 
 def list_series_tree(session: Session) -> list[Series]:
-    stmt = select(Series).options(selectinload(Series.seasons)).order_by(Series.title)
+    stmt = (
+        select(Series)
+        .options(selectinload(Series.seasons).selectinload(Season.episodes))
+        .order_by(Series.title)
+    )
     return list(session.execute(stmt).unique().scalars().all())
 
 
@@ -210,6 +214,75 @@ def episode_has_audio_language(episode: Episode, language_codes: set[str]) -> bo
     return any(
         t.type == "audio" and (t.language or "").lower() in language_codes for t in episode.tracks
     )
+
+
+def episode_runtime_deviates(episode: Episode, threshold: float = 0.15) -> bool:
+    """Desviación > 15% entre duración real y runtime oficial de TMDB (sección 5.4):
+    señal de episodio equivocado, versión extendida, o archivo truncado."""
+    if not episode.duration_s or not episode.tmdb_runtime_min:
+        return False
+    expected_s = episode.tmdb_runtime_min * 60
+    if expected_s <= 0:
+        return False
+    return abs(episode.duration_s - expected_s) / expected_s > threshold
+
+
+# --- TMDB -------------------------------------------------------------------
+
+
+def update_series_tmdb(
+    session: Session,
+    series: Series,
+    tmdb_id: int,
+    status: str,
+    title: str | None = None,
+    year: int | None = None,
+    poster_path: str | None = None,
+) -> None:
+    series.tmdb_id = tmdb_id
+    series.tmdb_status = status
+    if title:
+        series.title = title
+    if year is not None:
+        series.year = year
+    if poster_path is not None:
+        series.poster_path = poster_path
+
+
+def mark_series_tmdb_status(session: Session, series: Series, status: str) -> None:
+    series.tmdb_status = status
+
+
+def update_season_tmdb_count(session: Session, season: Season, episode_count: int) -> None:
+    season.tmdb_episode_count = episode_count
+
+
+def update_episode_tmdb(
+    session: Session,
+    episode: Episode,
+    title: str | None,
+    air_date: str | None,
+    runtime_min: int | None,
+) -> None:
+    episode.tmdb_title = title
+    episode.tmdb_air_date = air_date
+    episode.tmdb_runtime_min = runtime_min
+
+
+def list_series_needing_tmdb_sync(session: Session) -> list[Series]:
+    """Series que todavía no pasaron por ningún intento de matching."""
+    stmt = select(Series).where(Series.tmdb_status.is_(None)).order_by(Series.folder_name)
+    return list(session.execute(stmt).scalars().all())
+
+
+def list_series_pending_manual_tmdb(session: Session) -> list[Series]:
+    """Series ambiguas o previamente omitidas: necesitan que el usuario elija."""
+    stmt = (
+        select(Series)
+        .where(Series.tmdb_status.in_(("unmatched", "skipped")))
+        .order_by(Series.folder_name)
+    )
+    return list(session.execute(stmt).scalars().all())
 
 
 # --- jobs -----------------------------------------------------------------------
