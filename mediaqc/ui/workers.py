@@ -127,6 +127,7 @@ class ScanWorker(QRunnable):
                     "changed_count": total,
                     "missing_count": missing_count,
                     "probe_errors": probe_errors,
+                    "removed_empty_series": stats.get("removed_empty_series", 0),
                     "unparseable": [str(p) for p in scan_result.unparseable],
                     "unreachable_media_paths": [str(p) for p in scan_result.unreachable_media_paths],
                     "cancelled": cancelled,

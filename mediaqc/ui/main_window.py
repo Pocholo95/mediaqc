@@ -354,6 +354,8 @@ class MainWindow(QMainWindow):
         )
         if summary.get("unreachable_media_paths"):
             msg += f" {len(summary['unreachable_media_paths'])} carpeta(s) de librería no accesibles."
+        if summary.get("removed_empty_series"):
+            msg += f" {summary['removed_empty_series']} serie(s) vacías eliminadas del catálogo."
         if self._last_unparseable:
             msg += f" {len(self._last_unparseable)} archivo(s) no reconocidos."
         if summary.get("cancelled"):

@@ -62,9 +62,16 @@ def upsert_season(session: Session, series_id: int, number: int) -> Season:
 
 
 def upsert_episode(session: Session, season_id: int, scanned: ScannedEpisode) -> tuple[Episode, bool]:
-    """Devuelve ``(episode, changed)``. ``changed`` dispara re-probe/re-análisis."""
+    """Devuelve ``(episode, changed)``. ``changed`` dispara re-probe/re-análisis.
+
+    Se busca por ``path`` (identidad estable del archivo físico), no por
+    ``(season_id, number)``: si un escaneo posterior reparenta el archivo a
+    otra temporada/serie (p.ej. al corregir una detección de carpetas mal
+    hecha), esto lo re-parenta en vez de intentar insertar una fila
+    duplicada y romper la unicidad de ``episodes.path``.
+    """
     episode = session.execute(
-        select(Episode).where(Episode.season_id == season_id, Episode.number == scanned.number)
+        select(Episode).where(Episode.path == str(scanned.path))
     ).scalar_one_or_none()
 
     if episode is None:
@@ -84,7 +91,8 @@ def upsert_episode(session: Session, season_id: int, scanned: ScannedEpisode) ->
         return episode, True
 
     changed = episode.file_hash != scanned.file_hash
-    episode.path = str(scanned.path)
+    episode.season_id = season_id
+    episode.number = scanned.number
     episode.file_size = scanned.file_size
     episode.mtime = scanned.mtime
     episode.missing = False
@@ -127,11 +135,32 @@ def apply_scan_result(session: Session, scan_result: ScanResult) -> dict:
                 changed_episode_ids.append(episode.id)
                 new_count += 1
 
+    removed_empty_series = cleanup_empty_series(session)
+
     return {
         "seen_paths": seen_paths,
         "changed_episode_ids": changed_episode_ids,
         "changed_count": new_count,
+        "removed_empty_series": removed_empty_series,
     }
+
+
+def cleanup_empty_series(session: Session) -> int:
+    """Borra series sin ningún episodio (ninguna temporada tiene filas).
+
+    No borra episodios (spec sección 5.1): esto solo limpia contenedores
+    vacíos, típicamente series/temporadas fantasma que quedan cuando un
+    escaneo posterior reparenta sus episodios a la serie correcta (ver
+    ``upsert_episode``), o carpetas que nunca tuvieron video reconocible.
+    """
+    stmt = select(Series).options(selectinload(Series.seasons).selectinload(Season.episodes))
+    removed = 0
+    for series in session.execute(stmt).unique().scalars().all():
+        total_episodes = sum(len(season.episodes) for season in series.seasons)
+        if total_episodes == 0:
+            session.delete(series)
+            removed += 1
+    return removed
 
 
 def mark_missing_episodes(session: Session, reachable_media_paths: list[Path], seen_paths: set[str]) -> int:

@@ -126,6 +126,22 @@ class ScanResult:
         return {str(ep.path) for s in self.series for ep in s.episodes}
 
 
+def _series_dirs_under(media_path: Path) -> list[Path]:
+    """Subcarpetas de ``media_path`` que hay que tratar como series.
+
+    Normalmente cada hijo directo de ``media_path`` es una serie distinta.
+    Pero si a ``media_path`` le apuntaron directo a la carpeta de UNA sola
+    serie (todos sus hijos son carpetas "Season NN"/"Temporada NN"), tratar
+    cada temporada como una "serie" separada rompe el catálogo: el nombre de
+    la serie termina siendo "Season 01", y TMDB obviamente no encuentra nada
+    con ese nombre. En ese caso, ``media_path`` completo es la serie.
+    """
+    children = sorted(p for p in media_path.iterdir() if p.is_dir())
+    if children and all(parse_season_folder(c.name) is not None for c in children):
+        return [media_path]
+    return children
+
+
 def scan_media_paths(
     media_paths: Iterable[Path | str],
     progress_cb: Callable[[str], None] | None = None,
@@ -140,7 +156,7 @@ def scan_media_paths(
 
         result.reachable_media_paths.append(media_path)
 
-        for series_dir in sorted(p for p in media_path.iterdir() if p.is_dir()):
+        for series_dir in _series_dirs_under(media_path):
             title, year = parse_series_folder(series_dir.name)
             scanned_series = ScannedSeries(
                 path=series_dir, folder_name=series_dir.name, title=title, year=year

@@ -7,6 +7,7 @@ from mediaqc.core.scanner import (
     parse_filename_sxxexx,
     parse_season_folder,
     parse_series_folder,
+    scan_media_paths,
 )
 
 
@@ -110,3 +111,37 @@ def test_parse_episode_no_season_context_unparseable(tmp_path):
     series_root.mkdir()
     f = series_root / "07.mkv"
     assert parse_episode(f, series_root) is None
+
+
+def test_scan_media_path_pointed_directly_at_one_series(tmp_path):
+    # media_paths apuntando directo a la carpeta de UNA serie (todos sus hijos
+    # son "Season NN"): no hay que tratar cada temporada como una serie
+    # distinta, o el nombre de la serie termina siendo "Season 01" y TMDB
+    # nunca la encuentra.
+    show_root = tmp_path / "Nombre De La Serie"
+    (show_root / "Season 01").mkdir(parents=True)
+    (show_root / "Season 02").mkdir(parents=True)
+    (show_root / "Season 01" / "01 - Piloto.mkv").touch()
+    (show_root / "Season 02" / "01 - Vuelta.mkv").touch()
+
+    result = scan_media_paths([show_root])
+
+    assert len(result.series) == 1
+    assert result.series[0].folder_name == "Nombre De La Serie"
+    seasons = {ep.season for ep in result.series[0].episodes}
+    assert seasons == {1, 2}
+
+
+def test_scan_media_path_with_multiple_series_unaffected(tmp_path):
+    library_root = tmp_path / "Biblioteca"
+    show_a = library_root / "Serie A"
+    show_b = library_root / "Serie B"
+    (show_a / "Season 01").mkdir(parents=True)
+    (show_b / "Season 01").mkdir(parents=True)
+    (show_a / "Season 01" / "01.mkv").touch()
+    (show_b / "Season 01" / "01.mkv").touch()
+
+    result = scan_media_paths([library_root])
+
+    folder_names = {s.folder_name for s in result.series}
+    assert folder_names == {"Serie A", "Serie B"}
