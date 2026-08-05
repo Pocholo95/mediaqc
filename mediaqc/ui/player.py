@@ -71,8 +71,23 @@ class MpvPlayerWidget(QWidget):
         except Exception:
             logger.exception("seek falló en %s", self._current_path)
 
+    def seek_relative(self, delta_seconds: float) -> None:
+        if self._current_path is None:
+            return
+        try:
+            self.mpv.command("seek", delta_seconds, "relative")
+        except Exception:
+            logger.exception("seek relativo falló en %s", self._current_path)
+
     def toggle_pause(self) -> None:
         self.mpv.pause = not self.mpv.pause
+
+    @property
+    def is_paused(self) -> bool:
+        try:
+            return bool(self.mpv.pause)
+        except Exception:
+            return False
 
     @property
     def position_seconds(self) -> float:
@@ -81,24 +96,38 @@ class MpvPlayerWidget(QWidget):
         except Exception:
             return 0.0
 
-    # --- pistas de audio ---------------------------------------------------
+    @property
+    def duration_seconds(self) -> float:
+        try:
+            return float(self.mpv.duration or 0.0)
+        except Exception:
+            return 0.0
+
+    # --- pistas de audio / subtítulos ---------------------------------------
 
     @property
     def track_list(self) -> list[dict]:
-        """Pistas tal como las ve mpv. Cada entrada trae ``id`` (el que espera
-        ``aid``) y, para demuxers que lo exponen, ``ff-index`` — el índice de
-        stream de ffmpeg, que es el puente para mapear contra ``tracks.stream_index``
-        de la DB (mpv numera las pistas a su manera, no como ffprobe/mkvmerge)."""
+        """Pistas tal como las ve mpv, para debugging. No se usa para elegir
+        pista: ``set_audio_track``/``set_subtitle_track`` esperan el ordinal
+        1-based dentro de su tipo (n-ésima pista de audio/subtítulo en el
+        archivo), que es como mpv numera ``aid``/``sid`` — evita depender de
+        que ``track-list`` ya esté poblado justo después de ``load()``."""
         try:
             return list(self.mpv.track_list)
         except Exception:
             return []
 
-    def set_audio_track(self, mpv_track_id: int) -> None:
+    def set_audio_track(self, ordinal: int) -> None:
         try:
-            self.mpv.aid = mpv_track_id
+            self.mpv.aid = ordinal
         except Exception:
-            logger.exception("no se pudo cambiar a la pista de audio mpv id=%s", mpv_track_id)
+            logger.exception("no se pudo cambiar a la pista de audio ordinal=%s", ordinal)
+
+    def set_subtitle_track(self, ordinal: int | None) -> None:
+        try:
+            self.mpv.sid = ordinal if ordinal is not None else False
+        except Exception:
+            logger.exception("no se pudo cambiar a la pista de subtítulo ordinal=%s", ordinal)
 
     def add_external_audio(self, path: str) -> None:
         """Carga un candidato externo sobre el video, sin muxear nada (spec 5.6)."""

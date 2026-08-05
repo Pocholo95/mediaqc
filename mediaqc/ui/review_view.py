@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
@@ -62,9 +62,15 @@ class ReviewView(QWidget):
         self._episode_id: int | None = None
         self._marked_timestamp_ms: int | None = None
         self._window_positions: list[float] = []
+        self._timeline_dragging = False
 
         self._build_ui()
         self._setup_shortcuts()
+
+        self._position_timer = QTimer(self)
+        self._position_timer.setInterval(300)
+        self._position_timer.timeout.connect(self._update_position_display)
+        self._position_timer.start()
 
     # --- construcción de UI ------------------------------------------------
 
@@ -97,6 +103,25 @@ class ReviewView(QWidget):
             placeholder.setStyleSheet("background: #222; color: #ccc; padding: 40px;")
             layout.addWidget(placeholder, 3)
 
+        transport_bar = QHBoxLayout()
+        self.play_pause_btn = QPushButton("Pausar")
+        self.play_pause_btn.clicked.connect(self._toggle_pause)
+        transport_bar.addWidget(self.play_pause_btn)
+        back_btn = QPushButton("« 10s")
+        back_btn.clicked.connect(lambda: self._seek_relative(-10))
+        transport_bar.addWidget(back_btn)
+        fwd_btn = QPushButton("10s »")
+        fwd_btn.clicked.connect(lambda: self._seek_relative(10))
+        transport_bar.addWidget(fwd_btn)
+        self.position_label = QLabel("00:00 / 00:00")
+        transport_bar.addWidget(self.position_label)
+        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider.setRange(0, 0)
+        self.timeline_slider.sliderPressed.connect(self._on_timeline_pressed)
+        self.timeline_slider.sliderReleased.connect(self._on_timeline_released)
+        transport_bar.addWidget(self.timeline_slider, 1)
+        layout.addLayout(transport_bar)
+
         jump_bar = QHBoxLayout()
         jump_bar.addWidget(QLabel("Saltar a:"))
         self.jump_buttons: list[QPushButton] = []
@@ -119,6 +144,13 @@ class ReviewView(QWidget):
         self.load_candidate_btn.setToolTip("Disponible cuando el analizador de audio esté implementado (fase 4).")
         audio_bar.addWidget(self.load_candidate_btn)
         layout.addLayout(audio_bar)
+
+        subtitle_bar = QHBoxLayout()
+        subtitle_bar.addWidget(QLabel("Subtítulos:"))
+        self.subtitle_track_combo = QComboBox()
+        self.subtitle_track_combo.currentIndexChanged.connect(self._on_subtitle_track_changed)
+        subtitle_bar.addWidget(self.subtitle_track_combo, 1)
+        layout.addLayout(subtitle_bar)
 
         delay_bar = QHBoxLayout()
         delay_bar.addWidget(QLabel("Delay de audio:"))
@@ -217,6 +249,7 @@ class ReviewView(QWidget):
             self.title_label.setText(f"{series_title} — T{season_no}E{episode.number} — {display_title} [{status_label}]")
 
             self._populate_audio_tracks(episode)
+            self._populate_subtitle_tracks(episode)
             self._populate_windows(episode.duration_s)
             self._populate_history(session, episode_id)
 
@@ -234,20 +267,52 @@ class ReviewView(QWidget):
         self.delay_slider.blockSignals(False)
         self.delay_spin.blockSignals(False)
 
+        self.play_pause_btn.setText("Pausar")
+        self.timeline_slider.setRange(0, 0)
+        self.position_label.setText("00:00 / 00:00")
+
         if self.player is not None:
             self.player.load(file_path)
+            # mpv respeta el flag "default" del contenedor al cargar, que en
+            # la práctica muchas veces es el doblaje, no la referencia -- hay
+            # que forzarlo a lo que el combo ya muestra como elegido, si no
+            # el audio que suena y el que dice la UI quedan desincronizados.
+            self.player.set_audio_track(self.audio_track_combo.currentData())
+            self.player.set_subtitle_track(self.subtitle_track_combo.currentData())
 
     def _populate_audio_tracks(self, episode: Episode) -> None:
         self.audio_track_combo.blockSignals(True)
         self.audio_track_combo.clear()
-        for t in episode.tracks:
-            if t.type != "audio":
-                continue
+        audio_tracks = sorted(
+            (t for t in episode.tracks if t.type == "audio"),
+            key=lambda t: t.stream_index if t.stream_index is not None else 0,
+        )
+        for ordinal, t in enumerate(audio_tracks, start=1):
             label = f"{t.language or 'und'} · {t.codec or '?'} · {t.channels or '?'}ch"
             if t.title:
                 label += f" · {t.title}"
-            self.audio_track_combo.addItem(label, t.stream_index)
+            # ordinal 1-based dentro de las pistas de audio: es como mpv
+            # numera `aid` para un demuxer estándar, no el stream_index de
+            # ffprobe ni el track id de mkvmerge (trampa #1, aplica también acá).
+            self.audio_track_combo.addItem(label, ordinal)
         self.audio_track_combo.blockSignals(False)
+
+    def _populate_subtitle_tracks(self, episode: Episode) -> None:
+        self.subtitle_track_combo.blockSignals(True)
+        self.subtitle_track_combo.clear()
+        self.subtitle_track_combo.addItem("Sin subtítulos", None)
+        sub_tracks = sorted(
+            (t for t in episode.tracks if t.type == "subtitle"),
+            key=lambda t: t.stream_index if t.stream_index is not None else 0,
+        )
+        for ordinal, t in enumerate(sub_tracks, start=1):
+            label = t.language or "und"
+            if t.is_forced:
+                label += " (forzado)"
+            if t.title:
+                label += f" · {t.title}"
+            self.subtitle_track_combo.addItem(label, ordinal)
+        self.subtitle_track_combo.blockSignals(False)
 
     def _populate_windows(self, duration_s: float | None) -> None:
         self._window_positions = window_positions_seconds(duration_s or 0.0)
@@ -282,13 +347,46 @@ class ReviewView(QWidget):
     def _on_audio_track_changed(self, index: int) -> None:
         if self.player is None or index < 0:
             return
-        stream_index = self.audio_track_combo.itemData(index)
-        if stream_index is None:
+        ordinal = self.audio_track_combo.itemData(index)
+        if ordinal is not None:
+            self.player.set_audio_track(ordinal)
+
+    def _on_subtitle_track_changed(self, index: int) -> None:
+        if self.player is None or index < 0:
             return
-        for t in self.player.track_list:
-            if t.get("type") == "audio" and t.get("ff-index") == stream_index:
-                self.player.set_audio_track(t["id"])
-                return
+        ordinal = self.subtitle_track_combo.itemData(index)
+        self.player.set_subtitle_track(ordinal)
+
+    def _toggle_pause(self) -> None:
+        if self.player is None:
+            return
+        self.player.toggle_pause()
+        self.play_pause_btn.setText("Reanudar" if self.player.is_paused else "Pausar")
+
+    def _seek_relative(self, delta_seconds: float) -> None:
+        if self.player is not None:
+            self.player.seek_relative(delta_seconds)
+
+    def _on_timeline_pressed(self) -> None:
+        self._timeline_dragging = True
+
+    def _on_timeline_released(self) -> None:
+        self._timeline_dragging = False
+        if self.player is not None:
+            self.player.seek_absolute(self.timeline_slider.value())
+
+    def _update_position_display(self) -> None:
+        if self.player is None or not self.player.is_loaded() or self._timeline_dragging:
+            return
+        pos = self.player.position_seconds
+        dur = self.player.duration_seconds
+        self.position_label.setText(f"{_format_mmss(pos)} / {_format_mmss(dur)}")
+        if dur > 0:
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setRange(0, int(dur))
+            self.timeline_slider.setValue(int(pos))
+            self.timeline_slider.blockSignals(False)
+        self.play_pause_btn.setText("Reanudar" if self.player.is_paused else "Pausar")
 
     def _on_delay_slider_changed(self, value: int) -> None:
         if self.delay_spin.value() != value:
@@ -368,5 +466,6 @@ class ReviewView(QWidget):
         self.load_episode(self._queue[self._queue_index])
 
     def terminate_player(self) -> None:
+        self._position_timer.stop()
         if self.player is not None:
             self.player.terminate()
