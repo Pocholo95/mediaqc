@@ -1,0 +1,244 @@
+"""Repositorio: toda la escritura/lectura de SQLite pasa por acá.
+
+Funciones puras sobre una ``Session`` de SQLAlchemy — nada de PySide6. El
+caller (``ui/workers.py``) decide cuándo abrir sesión y hacer commit.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+from pathlib import Path
+
+from sqlalchemy import create_engine, delete, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, selectinload, sessionmaker
+
+from mediaqc.core.db.models import Analysis, Base, Episode, Job, Season, Series, Track
+from mediaqc.core.probe import ProbeResult
+from mediaqc.core.scanner import ScannedEpisode, ScanResult
+
+
+def create_db_engine(db_path: Path) -> Engine:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    return engine
+
+
+def make_session_factory(engine: Engine) -> sessionmaker:
+    return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+# --- series / seasons / episodes --------------------------------------------------
+
+
+def upsert_series(session: Session, path: Path, folder_name: str, title: str, year: int | None) -> Series:
+    series = session.execute(select(Series).where(Series.path == str(path))).scalar_one_or_none()
+    if series is None:
+        series = Series(path=str(path), folder_name=folder_name, title=title, year=year)
+        session.add(series)
+        session.flush()
+        return series
+
+    series.folder_name = folder_name
+    if series.tmdb_status is None:
+        # todavía no hay metadata de TMDB pisando el título: se puede actualizar libre
+        series.title = title
+        series.year = year
+    return series
+
+
+def upsert_season(session: Session, series_id: int, number: int) -> Season:
+    season = session.execute(
+        select(Season).where(Season.series_id == series_id, Season.number == number)
+    ).scalar_one_or_none()
+    if season is None:
+        season = Season(series_id=series_id, number=number)
+        session.add(season)
+        session.flush()
+    return season
+
+
+def upsert_episode(session: Session, season_id: int, scanned: ScannedEpisode) -> tuple[Episode, bool]:
+    """Devuelve ``(episode, changed)``. ``changed`` dispara re-probe/re-análisis."""
+    episode = session.execute(
+        select(Episode).where(Episode.season_id == season_id, Episode.number == scanned.number)
+    ).scalar_one_or_none()
+
+    if episode is None:
+        episode = Episode(
+            season_id=season_id,
+            number=scanned.number,
+            path=str(scanned.path),
+            file_size=scanned.file_size,
+            mtime=scanned.mtime,
+            file_hash=scanned.file_hash,
+            status="sin_analizar",
+            missing=False,
+            last_scanned_at=_dt.datetime.now(_dt.timezone.utc),
+        )
+        session.add(episode)
+        session.flush()
+        return episode, True
+
+    changed = episode.file_hash != scanned.file_hash
+    episode.path = str(scanned.path)
+    episode.file_size = scanned.file_size
+    episode.mtime = scanned.mtime
+    episode.missing = False
+    episode.last_scanned_at = _dt.datetime.now(_dt.timezone.utc)
+
+    if changed:
+        episode.file_hash = scanned.file_hash
+        episode.status = "sin_analizar"
+        session.execute(delete(Analysis).where(Analysis.episode_id == episode.id))
+
+    return episode, changed
+
+
+def apply_scan_result(session: Session, scan_result: ScanResult) -> dict:
+    """Vuelca un ``ScanResult`` a la DB: upsert de series/temporadas/episodios y
+    marcado de ausentes. Nunca borra filas de ``episodes`` (spec sección 5.1)."""
+    seen_paths: set[str] = set()
+    changed_episode_ids: list[int] = []
+    new_count = 0
+
+    for scanned_series in scan_result.series:
+        series = upsert_series(
+            session,
+            path=scanned_series.path,
+            folder_name=scanned_series.folder_name,
+            title=scanned_series.title,
+            year=scanned_series.year,
+        )
+        seasons_seen: dict[int, int] = {}
+        for scanned_ep in scanned_series.episodes:
+            season_id = seasons_seen.get(scanned_ep.season)
+            if season_id is None:
+                season = upsert_season(session, series.id, scanned_ep.season)
+                season_id = season.id
+                seasons_seen[scanned_ep.season] = season_id
+
+            episode, changed = upsert_episode(session, season_id, scanned_ep)
+            seen_paths.add(str(scanned_ep.path))
+            if changed:
+                changed_episode_ids.append(episode.id)
+                new_count += 1
+
+    return {
+        "seen_paths": seen_paths,
+        "changed_episode_ids": changed_episode_ids,
+        "changed_count": new_count,
+    }
+
+
+def mark_missing_episodes(session: Session, reachable_media_paths: list[Path], seen_paths: set[str]) -> int:
+    """Marca ``missing=True`` en episodios cuyo archivo desapareció, mirando
+    solo dentro de rutas que efectivamente se pudieron escanear (si un disco
+    está desconectado, no se toca nada de lo que había bajo esa ruta)."""
+    if not reachable_media_paths:
+        return 0
+    roots = [str(Path(p)) for p in reachable_media_paths]
+    episodes = session.execute(select(Episode)).scalars().all()
+    count = 0
+    for ep in episodes:
+        under_reachable_root = any(ep.path.startswith(root) for root in roots)
+        if not under_reachable_root:
+            continue
+        should_be_missing = ep.path not in seen_paths
+        if should_be_missing and not ep.missing:
+            ep.missing = True
+            count += 1
+        elif not should_be_missing and ep.missing:
+            ep.missing = False
+    return count
+
+
+def save_probe_result(session: Session, episode: Episode, probe_result: ProbeResult) -> None:
+    episode.duration_s = probe_result.duration_s
+    episode.video_fps = probe_result.video_fps
+    episode.container = probe_result.container
+
+    session.execute(delete(Track).where(Track.episode_id == episode.id))
+    for t in probe_result.tracks:
+        session.add(
+            Track(
+                episode_id=episode.id,
+                stream_index=t.stream_index,
+                mkv_track_id=t.mkv_track_id,
+                type=t.type,
+                codec=t.codec,
+                language=t.language,
+                title=t.title,
+                channels=t.channels,
+                is_default=t.is_default,
+                is_forced=t.is_forced,
+                container_delay_ms=t.container_delay_ms,
+            )
+        )
+
+
+# --- consultas para la UI -----------------------------------------------------
+
+
+def list_series_tree(session: Session) -> list[Series]:
+    stmt = select(Series).options(selectinload(Series.seasons)).order_by(Series.title)
+    return list(session.execute(stmt).unique().scalars().all())
+
+
+def list_episodes_for_season(session: Session, season_id: int) -> list[Episode]:
+    stmt = (
+        select(Episode)
+        .where(Episode.season_id == season_id)
+        .options(selectinload(Episode.tracks))
+        .order_by(Episode.number)
+    )
+    return list(session.execute(stmt).unique().scalars().all())
+
+
+def list_all_episodes(session: Session) -> list[Episode]:
+    stmt = select(Episode).options(
+        selectinload(Episode.tracks),
+        selectinload(Episode.season).selectinload(Season.series),
+    )
+    return list(session.execute(stmt).unique().scalars().all())
+
+
+def episode_has_audio_language(episode: Episode, language_codes: set[str]) -> bool:
+    return any(
+        t.type == "audio" and (t.language or "").lower() in language_codes for t in episode.tracks
+    )
+
+
+# --- jobs -----------------------------------------------------------------------
+
+
+def create_job(session: Session, kind: str, target_id: int | None = None) -> Job:
+    job = Job(kind=kind, target_id=target_id, state="pending", progress=0.0)
+    session.add(job)
+    session.flush()
+    return job
+
+
+def update_job(
+    session: Session,
+    job: Job,
+    state: str | None = None,
+    progress: float | None = None,
+    message: str | None = None,
+) -> None:
+    if state is not None:
+        job.state = state
+        if state in ("done", "failed"):
+            job.finished_at = _dt.datetime.now(_dt.timezone.utc)
+    if progress is not None:
+        job.progress = progress
+    if message is not None:
+        job.message = message
+
+
+def list_pending_jobs(session: Session) -> list[Job]:
+    stmt = select(Job).where(Job.state.in_(("pending", "running")))
+    return list(session.execute(stmt).scalars().all())

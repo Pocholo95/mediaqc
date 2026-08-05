@@ -1,0 +1,28 @@
+[project]
+name = "mediaqc"
+version = "0.1.0"
+description = "Detección y registro de problemas de sincronización de doblaje en una librería de BD rips."
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6",
+    "SQLAlchemy>=2.0",
+    "numpy",
+    "scipy",
+    "httpx",
+    "platformdirs",
+    "python-mpv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+build = ["pyinstaller"]
+
+[project.scripts]
+mediaqc = "mediaqc.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mediaqc*"]

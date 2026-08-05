@@ -1,0 +1,16 @@
+name: mediaqc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pyside6
+  - sqlalchemy
+  - numpy
+  - scipy
+  - httpx
+  - platformdirs
+  - pytest
+  - pip
+  - pip:
+      - python-mpv
+      - pyinstaller
