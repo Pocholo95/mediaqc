@@ -150,7 +150,7 @@ class ScanResult:
         return {str(ep.path) for s in self.series for ep in s.episodes}
 
 
-def _series_dirs_under(media_path: Path) -> list[Path]:
+def series_dirs_under(media_path: Path) -> list[Path]:
     """Subcarpetas de ``media_path`` que hay que tratar como series.
 
     Normalmente cada hijo directo de ``media_path`` es una serie distinta.
@@ -180,7 +180,7 @@ def scan_media_paths(
 
         result.reachable_media_paths.append(media_path)
 
-        for series_dir in _series_dirs_under(media_path):
+        for series_dir in series_dirs_under(media_path):
             title, year = parse_series_folder(series_dir.name)
             scanned_series = ScannedSeries(
                 path=series_dir, folder_name=series_dir.name, title=title, year=year

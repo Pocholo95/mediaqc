@@ -45,7 +45,14 @@ from mediaqc.ui.review_view import ReviewView
 from mediaqc.ui.settings_dialog import SettingsDialog
 from mediaqc.ui.theme import apply_theme
 from mediaqc.ui.tmdb_dialog import TmdbMatchDialog
-from mediaqc.ui.workers import AnalyzeWorker, ScanWorker, TmdbApplyWorker, TmdbSearchWorker, TmdbSyncWorker
+from mediaqc.ui.workers import (
+    AnalyzeWorker,
+    CandidatesScanWorker,
+    ScanWorker,
+    TmdbApplyWorker,
+    TmdbSearchWorker,
+    TmdbSyncWorker,
+)
 
 
 class MainWindow(QMainWindow):
@@ -58,6 +65,7 @@ class MainWindow(QMainWindow):
         self._current_worker: ScanWorker | None = None
         self._current_tmdb_worker: TmdbSyncWorker | None = None
         self._current_analyze_worker: AnalyzeWorker | None = None
+        self._current_candidates_worker: CandidatesScanWorker | None = None
         self._last_unparseable: list[str] = []
 
         self.setWindowTitle("MediaQC")
@@ -134,6 +142,9 @@ class MainWindow(QMainWindow):
 
         self.scan_action = menu.addAction("Escanear biblioteca")
         self.scan_action.triggered.connect(self._start_scan)
+
+        self.candidates_scan_action = menu.addAction("Escanear candidatos externos")
+        self.candidates_scan_action.triggered.connect(self._start_candidates_scan)
 
         unparseable_action = menu.addAction("Ver archivos no reconocidos...")
         unparseable_action.triggered.connect(self._show_unparseable)
@@ -334,6 +345,8 @@ class MainWindow(QMainWindow):
             self._current_tmdb_worker.cancel()
         if self._current_analyze_worker is not None:
             self._current_analyze_worker.cancel()
+        if self._current_candidates_worker is not None:
+            self._current_candidates_worker.cancel()
         self.status_label.setText("Cancelando...")
 
     def _on_scan_progress(self, message: str, current: int, total: int) -> None:
@@ -569,6 +582,62 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Error en el análisis.")
         QMessageBox.critical(self, "Error de análisis", message)
 
+    # --- candidatos externos (modo externo) -------------------------------
+
+    def _start_candidates_scan(self) -> None:
+        if not self.config.candidates_paths:
+            QMessageBox.information(
+                self,
+                "Sin carpetas de candidatos",
+                "Configurá al menos una carpeta de candidatos en Preferencias. "
+                "Es opcional: sin ella, la app funciona igual analizando solo pistas internas.",
+            )
+            return
+        if self._current_candidates_worker is not None:
+            return
+
+        worker = CandidatesScanWorker(self.session_factory, self.config.candidates_paths)
+        worker.signals.progress.connect(self._on_scan_progress)
+        worker.signals.finished.connect(self._on_candidates_scan_finished)
+        worker.signals.error.connect(self._on_candidates_scan_error)
+        self._current_candidates_worker = worker
+
+        self.candidates_scan_action.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.cancel_button.setVisible(True)
+        self.status_label.setText("Escaneando candidatos externos...")
+
+        self.thread_pool.start(worker)
+
+    def _on_candidates_scan_finished(self, summary: dict) -> None:
+        self._current_candidates_worker = None
+        self.candidates_scan_action.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+
+        if summary.get("cancelled"):
+            self.status_label.setText("Escaneo de candidatos cancelado.")
+        else:
+            msg = f"Candidatos: {summary['matched']} emparejados."
+            if summary.get("unmatched_episode"):
+                msg += f" {summary['unmatched_episode']} sin episodio correspondiente."
+            if summary.get("unmatched_series"):
+                msg += f" {summary['unmatched_series']} carpeta(s) sin serie reconocida."
+            if summary.get("unparseable"):
+                msg += f" {summary['unparseable']} archivo(s) no reconocidos."
+            if summary.get("missing"):
+                msg += f" {summary['missing']} marcados ausentes."
+            self.status_label.setText(msg)
+
+    def _on_candidates_scan_error(self, message: str) -> None:
+        self._current_candidates_worker = None
+        self.candidates_scan_action.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.status_label.setText("Error escaneando candidatos.")
+        QMessageBox.critical(self, "Error de candidatos", message)
+
     # --- preferencias / jobs pendientes --------------------------------
 
     def _open_settings(self) -> None:
@@ -596,5 +665,7 @@ class MainWindow(QMainWindow):
             self._current_tmdb_worker.cancel()
         if self._current_analyze_worker is not None:
             self._current_analyze_worker.cancel()
+        if self._current_candidates_worker is not None:
+            self._current_candidates_worker.cancel()
         self.review_view.terminate_player()
         super().closeEvent(event)

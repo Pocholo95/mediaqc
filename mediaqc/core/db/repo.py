@@ -13,7 +13,8 @@ from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
-from mediaqc.core.db.models import Analysis, Base, Episode, Job, Review, Season, Series, Track
+from mediaqc.core.candidates import CandidatesScanResult, ScannedCandidate, build_series_lookup
+from mediaqc.core.db.models import Analysis, Base, Candidate, Episode, Job, Review, Season, Series, Track
 from mediaqc.core.probe import ProbeResult
 from mediaqc.core.scanner import ScannedEpisode, ScanResult
 
@@ -467,6 +468,148 @@ def save_analysis(
 
 def list_analyses_for_episode(session: Session, episode_id: int) -> list[Analysis]:
     stmt = select(Analysis).where(Analysis.episode_id == episode_id).order_by(Analysis.analyzed_at.desc())
+    return list(session.execute(stmt).scalars().all())
+
+
+# --- candidatos externos (modo externo, spec 5.3) ------------------------------
+
+
+def build_series_lookup_for_candidates(session: Session) -> dict[str, int]:
+    series_rows = session.execute(select(Series)).scalars().all()
+    return build_series_lookup(series_rows)
+
+
+def get_episode_by_series_season_number(
+    session: Session, series_id: int, season_number: int, episode_number: int
+) -> Episode | None:
+    stmt = (
+        select(Episode)
+        .join(Season, Episode.season_id == Season.id)
+        .where(Season.series_id == series_id, Season.number == season_number, Episode.number == episode_number)
+    )
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def upsert_candidate(
+    session: Session,
+    episode_id: int,
+    path: Path,
+    kind: str,
+    file_size: int,
+    mtime: float,
+    matched_by: str,
+    match_confidence: float,
+) -> Candidate:
+    candidate = session.execute(select(Candidate).where(Candidate.path == str(path))).scalar_one_or_none()
+    if candidate is None:
+        candidate = Candidate(
+            episode_id=episode_id,
+            path=str(path),
+            kind=kind,
+            file_size=file_size,
+            mtime=mtime,
+            matched_by=matched_by,
+            match_confidence=match_confidence,
+            missing=False,
+        )
+        session.add(candidate)
+        session.flush()
+        return candidate
+
+    candidate.file_size = file_size
+    candidate.mtime = mtime
+    if candidate.matched_by != "manual":
+        # no pisar una reasignación manual del usuario con un re-escaneo
+        # automático -- ni el episodio, ni la etiqueta de confianza.
+        candidate.episode_id = episode_id
+        candidate.matched_by = matched_by
+        candidate.match_confidence = match_confidence
+    candidate.missing = False
+    return candidate
+
+
+def apply_candidates_scan_result(session: Session, scan_result: CandidatesScanResult) -> dict:
+    """Vuelca un ``CandidatesScanResult`` a la DB. Confianza por grupo
+    (serie, temporada): 1.0 si la cantidad de candidatos matchea la de
+    episodios de esa temporada y los números no se repiten (spec 5.3);
+    si no, 0.5 y queda visible para confirmar a mano."""
+    groups: dict[tuple[int, int], list[ScannedCandidate]] = {}
+    for c in scan_result.candidates:
+        groups.setdefault((c.series_id, c.season), []).append(c)
+
+    seen_paths: set[str] = set()
+    matched = 0
+    unmatched_episode = 0
+
+    for (series_id, season_number), items in groups.items():
+        season = session.execute(
+            select(Season).where(Season.series_id == series_id, Season.number == season_number)
+        ).scalar_one_or_none()
+        episode_count = len(season.episodes) if season is not None else 0
+        numbers = {c.number for c in items}
+        confident = season is not None and len(items) == episode_count and len(numbers) == len(items)
+        confidence = 1.0 if confident else 0.5
+
+        for c in items:
+            seen_paths.add(str(c.path))
+            episode = get_episode_by_series_season_number(session, series_id, season_number, c.number)
+            if episode is None:
+                unmatched_episode += 1
+                continue
+            upsert_candidate(
+                session,
+                episode_id=episode.id,
+                path=c.path,
+                kind=c.kind,
+                file_size=c.file_size,
+                mtime=c.mtime,
+                matched_by="auto",
+                match_confidence=confidence,
+            )
+            matched += 1
+
+    return {"seen_paths": seen_paths, "matched": matched, "unmatched_episode": unmatched_episode}
+
+
+def mark_missing_candidates(session: Session, reachable_candidates_paths: list[Path], seen_paths: set[str]) -> int:
+    if not reachable_candidates_paths:
+        return 0
+    roots = [str(Path(p)) for p in reachable_candidates_paths]
+    candidates = session.execute(select(Candidate)).scalars().all()
+    count = 0
+    for c in candidates:
+        if not any(c.path.startswith(root) for root in roots):
+            continue
+        should_be_missing = c.path not in seen_paths
+        if should_be_missing and not c.missing:
+            c.missing = True
+            count += 1
+        elif not should_be_missing and c.missing:
+            c.missing = False
+    return count
+
+
+def list_candidates_for_episode(session: Session, episode_id: int) -> list[Candidate]:
+    stmt = select(Candidate).where(Candidate.episode_id == episode_id, Candidate.missing.is_(False))
+    return list(session.execute(stmt).scalars().all())
+
+
+def reassign_candidate(session: Session, candidate_id: int, new_episode_id: int) -> Candidate | None:
+    candidate = session.get(Candidate, candidate_id)
+    if candidate is None:
+        return None
+    candidate.episode_id = new_episode_id
+    candidate.matched_by = "manual"
+    candidate.match_confidence = 1.0
+    return candidate
+
+
+def list_low_confidence_candidates(session: Session) -> list[Candidate]:
+    stmt = (
+        select(Candidate)
+        .where(Candidate.missing.is_(False), Candidate.match_confidence < 1.0)
+        .options(selectinload(Candidate.episode).selectinload(Episode.season).selectinload(Season.series))
+    )
     return list(session.execute(stmt).scalars().all())
 
 

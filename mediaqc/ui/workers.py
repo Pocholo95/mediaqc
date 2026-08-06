@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
+from mediaqc.core import candidates as candidates_module
 from mediaqc.core import pairs as pairs_module
 from mediaqc.core import probe, scanner, tmdb
 from mediaqc.core.analyzer import analyze, correlate
@@ -394,3 +395,72 @@ class AnalyzeWorker(QRunnable):
         correlate.purge_audio_cache(self.audio_cache_dir, limit_bytes)
 
         self.signals.finished.emit({"analyzed": analyzed, "no_pairs": no_pairs, "errors": errors, "total": total})
+
+
+class _ScanCancelled(Exception):
+    pass
+
+
+class CandidatesScanWorker(QRunnable):
+    """Escanea ``candidates_paths`` y empareja audios/subtítulos sueltos con
+    episodios por número (spec sección 5.3, modo externo)."""
+
+    def __init__(self, session_factory, candidates_paths: list[str]) -> None:
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.session_factory = session_factory
+        self.candidates_paths = candidates_paths
+        self._cancel_event = threading.Event()
+        self.setAutoDelete(True)
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def _on_progress(self, path_str: str) -> None:
+        if self._cancel_event.is_set():
+            raise _ScanCancelled()
+        self.signals.progress.emit(f"Candidato: {Path(path_str).name}", 0, 0)
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except _ScanCancelled:
+            self.signals.finished.emit(
+                {"matched": 0, "unmatched_episode": 0, "unmatched_series": 0, "unparseable": 0, "missing": 0, "cancelled": True}
+            )
+        except Exception as exc:
+            logger.exception("candidates scan worker failed")
+            self.signals.error.emit(str(exc))
+
+    def _run(self) -> None:
+        if not self.candidates_paths:
+            self.signals.finished.emit(
+                {"matched": 0, "unmatched_episode": 0, "unmatched_series": 0, "unparseable": 0, "missing": 0}
+            )
+            return
+
+        self.signals.progress.emit("Escaneando candidatos...", 0, 0)
+
+        with self.session_factory() as session:
+            known_series = repo.build_series_lookup_for_candidates(session)
+
+        scan_result = candidates_module.scan_candidate_paths(
+            self.candidates_paths, known_series, progress_cb=self._on_progress
+        )
+
+        with self.session_factory() as session:
+            stats = repo.apply_candidates_scan_result(session, scan_result)
+            missing_count = repo.mark_missing_candidates(
+                session, scan_result.reachable_candidates_paths, stats["seen_paths"]
+            )
+            session.commit()
+
+        self.signals.finished.emit(
+            {
+                "matched": stats["matched"],
+                "unmatched_episode": stats["unmatched_episode"],
+                "unmatched_series": len(scan_result.unmatched_series_dirs),
+                "unparseable": len(scan_result.unparseable),
+                "missing": missing_count,
+            }
+        )

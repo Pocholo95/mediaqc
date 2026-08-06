@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 from mediaqc.core.analyzer.analyze import windows_from_json
 from mediaqc.core.analyzer.windows import window_positions_seconds
 from mediaqc.core.db import repo
-from mediaqc.core.db.models import Episode
+from mediaqc.core.db.models import Candidate, Episode
 from mediaqc.ui.library_view import STATUS_LABELS
 from mediaqc.ui.player import MpvInitError, MpvPlayerWidget
 
@@ -142,10 +142,6 @@ class ReviewView(QWidget):
         self.audio_track_combo = QComboBox()
         self.audio_track_combo.currentIndexChanged.connect(self._on_audio_track_changed)
         audio_bar.addWidget(self.audio_track_combo, 1)
-        self.load_candidate_btn = QPushButton("Cargar candidato con delay sugerido")
-        self.load_candidate_btn.setEnabled(False)  # candidatos/sugerencias llegan en fases 4-5
-        self.load_candidate_btn.setToolTip("Disponible cuando el analizador de audio esté implementado (fase 4).")
-        audio_bar.addWidget(self.load_candidate_btn)
         layout.addLayout(audio_bar)
 
         subtitle_bar = QHBoxLayout()
@@ -154,6 +150,18 @@ class ReviewView(QWidget):
         self.subtitle_track_combo.currentIndexChanged.connect(self._on_subtitle_track_changed)
         subtitle_bar.addWidget(self.subtitle_track_combo, 1)
         layout.addLayout(subtitle_bar)
+
+        candidates_bar = QHBoxLayout()
+        candidates_bar.addWidget(QLabel("Candidatos externos:"))
+        self.candidates_combo = QComboBox()
+        candidates_bar.addWidget(self.candidates_combo, 1)
+        self.load_candidate_btn = QPushButton("Cargar en el reproductor")
+        self.load_candidate_btn.clicked.connect(self._load_selected_candidate)
+        candidates_bar.addWidget(self.load_candidate_btn)
+        self.reassign_candidate_btn = QPushButton("Reasignar...")
+        self.reassign_candidate_btn.clicked.connect(self._reassign_selected_candidate)
+        candidates_bar.addWidget(self.reassign_candidate_btn)
+        layout.addLayout(candidates_bar)
 
         delay_bar = QHBoxLayout()
         delay_bar.addWidget(QLabel("Delay de audio:"))
@@ -167,6 +175,19 @@ class ReviewView(QWidget):
         self.delay_spin.valueChanged.connect(self._on_delay_spin_changed)
         delay_bar.addWidget(self.delay_spin)
         layout.addLayout(delay_bar)
+
+        sub_delay_bar = QHBoxLayout()
+        sub_delay_bar.addWidget(QLabel("Delay de subtítulos:"))
+        self.sub_delay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sub_delay_slider.setRange(-5000, 5000)
+        self.sub_delay_slider.valueChanged.connect(self._on_sub_delay_slider_changed)
+        sub_delay_bar.addWidget(self.sub_delay_slider, 1)
+        self.sub_delay_spin = QSpinBox()
+        self.sub_delay_spin.setRange(-5000, 5000)
+        self.sub_delay_spin.setSuffix(" ms")
+        self.sub_delay_spin.valueChanged.connect(self._on_sub_delay_spin_changed)
+        sub_delay_bar.addWidget(self.sub_delay_spin)
+        layout.addLayout(sub_delay_bar)
 
         self.windows_table = QTableWidget(5, 3)
         self.windows_table.setHorizontalHeaderLabels(["Posición", "Offset medido", "Score"])
@@ -259,6 +280,7 @@ class ReviewView(QWidget):
 
             self._populate_audio_tracks(episode)
             self._populate_subtitle_tracks(episode)
+            self._populate_candidates(session, episode_id)
             self._populate_windows(episode.duration_s)
             self._populate_history(session, episode_id)
 
@@ -273,6 +295,13 @@ class ReviewView(QWidget):
         self.timeline_slider.setRange(0, 0)
         self.position_label.setText("00:00 / 00:00")
 
+        self.sub_delay_slider.blockSignals(True)
+        self.sub_delay_spin.blockSignals(True)
+        self.sub_delay_slider.setValue(0)
+        self.sub_delay_spin.setValue(0)
+        self.sub_delay_slider.blockSignals(False)
+        self.sub_delay_spin.blockSignals(False)
+
         if self.player is not None:
             self.player.load(file_path)
             # mpv respeta el flag "default" del contenedor al cargar, que en
@@ -281,6 +310,7 @@ class ReviewView(QWidget):
             # el audio que suena y el que dice la UI quedan desincronizados.
             self.player.set_audio_track(self.audio_track_combo.currentData())
             self.player.set_subtitle_track(self.subtitle_track_combo.currentData())
+            self.player.set_subtitle_delay(0.0)
 
         # va después de load(): aplica el delay sugerido (si lo hay para la
         # pista elegida) sobre el archivo ya cargado.
@@ -332,6 +362,71 @@ class ReviewView(QWidget):
             self.subtitle_track_combo.addItem(label, ordinal)
         self.subtitle_track_combo.setCurrentIndex(default_index)
         self.subtitle_track_combo.blockSignals(False)
+
+    def _populate_candidates(self, session, episode_id: int) -> None:
+        """Candidatos externos (spec 5.3, modo externo): audios/subtítulos
+        sueltos emparejados con este episodio, listos para previsualizar sin
+        muxear nada."""
+        self.candidates_combo.clear()
+        candidates = repo.list_candidates_for_episode(session, episode_id)
+        if not candidates:
+            self.candidates_combo.addItem("(sin candidatos externos)", None)
+        for c in candidates:
+            label = f"{c.kind} · {Path(c.path).name}"
+            if c.match_confidence is not None and c.match_confidence < 1.0:
+                label += " (confirmar match)"
+            self.candidates_combo.addItem(label, c.id)
+        self.load_candidate_btn.setEnabled(bool(candidates))
+        self.reassign_candidate_btn.setEnabled(bool(candidates))
+
+    def _load_selected_candidate(self) -> None:
+        candidate_id = self.candidates_combo.currentData()
+        if candidate_id is None or self.player is None:
+            return
+        with self.session_factory() as session:
+            candidate = session.get(Candidate, candidate_id)
+            if candidate is None:
+                return
+            path, kind = candidate.path, candidate.kind
+
+        if kind == "audio":
+            self.player.add_external_audio(path)
+        elif kind == "subtitle":
+            self.player.add_external_subtitle(path)
+
+    def _reassign_selected_candidate(self) -> None:
+        candidate_id = self.candidates_combo.currentData()
+        if candidate_id is None or self._episode_id is None:
+            return
+
+        with self.session_factory() as session:
+            episode = session.get(Episode, self._episode_id)
+            if episode is None or episode.season is None:
+                return
+            series_id = episode.season.series_id
+            season_number = episode.season.number
+            current_number = episode.number
+
+        number, ok = QInputDialog.getInt(
+            self,
+            "Reasignar candidato",
+            "Número de episodio correcto (misma temporada):",
+            current_number,
+            1,
+            9999,
+        )
+        if not ok:
+            return
+
+        with self.session_factory() as session:
+            target = repo.get_episode_by_series_season_number(session, series_id, season_number, number)
+            if target is None:
+                QMessageBox.warning(self, "No encontrado", f"No hay episodio número {number} en esta temporada.")
+                return
+            repo.reassign_candidate(session, candidate_id, target.id)
+            session.commit()
+
+        self.load_episode(self._episode_id)
 
     def _populate_windows(self, duration_s: float | None) -> None:
         self._window_positions = window_positions_seconds(duration_s or 0.0)
@@ -455,6 +550,22 @@ class ReviewView(QWidget):
             self.delay_slider.blockSignals(False)
         if self.player is not None:
             self.player.set_audio_delay(value / 1000.0)
+
+    def _on_sub_delay_slider_changed(self, value: int) -> None:
+        if self.sub_delay_spin.value() != value:
+            self.sub_delay_spin.blockSignals(True)
+            self.sub_delay_spin.setValue(value)
+            self.sub_delay_spin.blockSignals(False)
+        if self.player is not None:
+            self.player.set_subtitle_delay(value / 1000.0)
+
+    def _on_sub_delay_spin_changed(self, value: int) -> None:
+        if self.sub_delay_slider.value() != value:
+            self.sub_delay_slider.blockSignals(True)
+            self.sub_delay_slider.setValue(value)
+            self.sub_delay_slider.blockSignals(False)
+        if self.player is not None:
+            self.player.set_subtitle_delay(value / 1000.0)
 
     def _mark_problem_here(self) -> None:
         if self.player is None:

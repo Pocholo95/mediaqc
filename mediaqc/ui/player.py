@@ -136,6 +136,13 @@ class MpvPlayerWidget(QWidget):
         except Exception:
             logger.exception("no se pudo cargar el candidato externo %s", path)
 
+    def add_external_subtitle(self, path: str) -> None:
+        """Análogo a ``add_external_audio`` pero para subtítulos sueltos."""
+        try:
+            self.mpv.command("sub-add", path, "select")
+        except Exception:
+            logger.exception("no se pudo cargar el subtítulo externo %s", path)
+
     # --- delay ---------------------------------------------------------------
 
     def set_audio_delay(self, seconds: float) -> None:
@@ -147,6 +154,18 @@ class MpvPlayerWidget(QWidget):
     def get_audio_delay(self) -> float:
         try:
             return float(self.mpv.audio_delay)
+        except Exception:
+            return 0.0
+
+    def set_subtitle_delay(self, seconds: float) -> None:
+        try:
+            self.mpv.sub_delay = seconds
+        except Exception:
+            logger.exception("no se pudo aplicar sub_delay=%s", seconds)
+
+    def get_subtitle_delay(self) -> float:
+        try:
+            return float(self.mpv.sub_delay)
         except Exception:
             return 0.0
 

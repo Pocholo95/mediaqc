@@ -1,19 +1,26 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
+from mediaqc.core.candidates import CandidatesScanResult, ScannedCandidate
 from mediaqc.core.db.repo import (
+    apply_candidates_scan_result,
     apply_scan_result,
     create_db_engine,
     episode_runtime_deviates,
+    list_candidates_for_episode,
     list_episode_reviews,
     list_problem_episodes,
     list_review_queue,
     list_series_tree,
     make_session_factory,
+    mark_missing_candidates,
+    reassign_candidate,
     record_review,
 )
-from mediaqc.core.db.models import Episode, Season, Series
+from mediaqc.core.db.models import Candidate, Episode, Season, Series
 from mediaqc.core.scanner import ScannedEpisode, ScannedSeries, ScanResult
 
 
@@ -210,3 +217,104 @@ def test_list_problem_episodes_only_problema_status(tmp_path):
     with session_factory() as session:
         problems = list_problem_episodes(session)
         assert [e.id for e in problems] == [episode_id]
+
+
+def _seed_series_with_episodes(tmp_path, episode_numbers):
+    engine = create_db_engine(tmp_path / "mediaqc.db")
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        series = Series(path="X", folder_name="Fire Force")
+        season = Season(number=1)
+        for n in episode_numbers:
+            season.episodes.append(Episode(number=n, path=f"ep{n}.mkv", status="analizado"))
+        series.seasons.append(season)
+        session.add(series)
+        session.commit()
+        series_id = series.id
+    return session_factory, series_id
+
+
+def _candidate(path, series_id, number, kind="subtitle"):
+    return ScannedCandidate(path=Path(path), series_id=series_id, season=1, number=number, kind=kind, file_size=1, mtime=1.0)
+
+
+def test_apply_candidates_scan_result_high_confidence_when_counts_match(tmp_path):
+    session_factory, series_id = _seed_series_with_episodes(tmp_path, [1, 2])
+    scan_result = CandidatesScanResult(candidates=[_candidate("c1.srt", series_id, 1), _candidate("c2.srt", series_id, 2)])
+
+    with session_factory() as session:
+        stats = apply_candidates_scan_result(session, scan_result)
+        session.commit()
+        assert stats["matched"] == 2
+
+        ep1 = session.execute(select(Episode).where(Episode.number == 1)).scalars().first()
+        candidates = list_candidates_for_episode(session, ep1.id)
+        assert len(candidates) == 1
+        assert candidates[0].match_confidence == 1.0
+        assert candidates[0].matched_by == "auto"
+
+
+def test_apply_candidates_scan_result_low_confidence_when_count_mismatch(tmp_path):
+    # 3 episodios en la temporada, un solo candidato -> no es 1:1, confianza baja.
+    session_factory, series_id = _seed_series_with_episodes(tmp_path, [1, 2, 3])
+    scan_result = CandidatesScanResult(candidates=[_candidate("c1.srt", series_id, 1)])
+
+    with session_factory() as session:
+        apply_candidates_scan_result(session, scan_result)
+        session.commit()
+        ep1 = session.execute(select(Episode).where(Episode.number == 1)).scalars().first()
+        candidates = list_candidates_for_episode(session, ep1.id)
+        assert candidates[0].match_confidence == 0.5
+
+
+def test_apply_candidates_scan_result_skips_unmatched_episode_number(tmp_path):
+    session_factory, series_id = _seed_series_with_episodes(tmp_path, [1])
+    scan_result = CandidatesScanResult(candidates=[_candidate("c99.srt", series_id, 99)])
+
+    with session_factory() as session:
+        stats = apply_candidates_scan_result(session, scan_result)
+        assert stats["matched"] == 0
+        assert stats["unmatched_episode"] == 1
+
+
+def test_manual_reassignment_survives_rescan(tmp_path):
+    session_factory, series_id = _seed_series_with_episodes(tmp_path, [1, 2])
+    scan_result = CandidatesScanResult(candidates=[_candidate("c1.srt", series_id, 1)])
+
+    with session_factory() as session:
+        apply_candidates_scan_result(session, scan_result)
+        session.commit()
+        candidate = session.execute(select(Candidate)).scalars().first()
+        ep2 = session.execute(select(Episode).where(Episode.number == 2)).scalars().first()
+        reassign_candidate(session, candidate.id, ep2.id)
+        session.commit()
+        candidate_id = candidate.id
+
+    # re-escanear (mismo resultado auto) no debe pisar la reasignación manual
+    with session_factory() as session:
+        apply_candidates_scan_result(session, scan_result)
+        session.commit()
+        candidate = session.get(Candidate, candidate_id)
+        assert candidate.matched_by == "manual"
+        reassigned_episode = session.get(Episode, candidate.episode_id)
+        assert reassigned_episode.number == 2
+
+
+def test_mark_missing_candidates_when_file_disappears(tmp_path):
+    session_factory, series_id = _seed_series_with_episodes(tmp_path, [1])
+    candidates_root = tmp_path / "candidates_root"
+    scan_result = CandidatesScanResult(
+        candidates=[_candidate(candidates_root / "c1.srt", series_id, 1)],
+        reachable_candidates_paths=[candidates_root],
+    )
+
+    with session_factory() as session:
+        apply_candidates_scan_result(session, scan_result)
+        session.commit()
+
+    with session_factory() as session:
+        removed = mark_missing_candidates(session, scan_result.reachable_candidates_paths, seen_paths=set())
+        session.commit()
+        assert removed == 1
+        candidate = session.execute(select(Candidate)).scalars().first()
+        assert candidate.missing is True
