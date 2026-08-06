@@ -278,6 +278,13 @@ def apply_series_match(session: Session, client: TmdbClient, series: Series, tmd
         poster_path=str(local_poster) if local_poster else None,
     )
 
+    if series.reference_language is None:
+        # Semilla inicial de la pista de referencia (spec 5.3b): la pista
+        # que vino con el video del BD está en el idioma original, no en el
+        # que TMDB marca como default de la ficha. El usuario la puede
+        # sobrescribir una vez y queda para toda la serie.
+        series.reference_language = details.get("original_language") or None
+
     for season in series.seasons:
         try:
             season_data = client.get_season_details(tmdb_id, season.number)
@@ -300,6 +307,24 @@ def apply_series_match(session: Session, client: TmdbClient, series: Series, tmd
                 air_date=ep_data.get("air_date") or None,
                 runtime_min=ep_data.get("runtime"),
             )
+
+
+def ensure_reference_language(session: Session, client: TmdbClient, series: Series) -> None:
+    """Rellena ``reference_language`` en series que ya tienen ``tmdb_id`` de
+    antes de que existiera este campo (ver migración en ``repo.create_db_engine``).
+    Sin esto, ``core/pairs.py`` cae al fallback de ``is_default`` -- que en
+    muchos rips es el doblaje, no el idioma original, y arruina la elección
+    de referencia para el analizador."""
+    if series.reference_language is not None:
+        return
+    if not series.tmdb_id or not client.enabled:
+        return
+    try:
+        details = client.get_tv_details(series.tmdb_id)
+    except TmdbError as exc:
+        logger.warning("no se pudo traer original_language de %s: %s", series.folder_name, exc)
+        return
+    series.reference_language = details.get("original_language") or None
 
 
 def sync_new_series(session: Session, client: TmdbClient, series: Series) -> str:

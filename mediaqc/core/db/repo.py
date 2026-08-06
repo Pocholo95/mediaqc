@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as _dt
 from pathlib import Path
 
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
@@ -33,11 +33,12 @@ VALID_VERDICTS = {
     "otro",
 }
 
-# "analizado": recién probado, todavía no pasó por el analizador de audio
-# (fase 4, no existe todavía). "pendiente_revision": ya tiene un veredicto
-# automático esperando confirmación humana. Sin analizador, ambos significan
-# lo mismo para el semáforo y la cola de revisión: "listo para que lo mire
-# un humano".
+# "analizado": recién probado, todavía no pasó por el analizador de audio.
+# "pendiente_revision": ya tiene un veredicto automático (AnalyzeWorker)
+# esperando confirmación humana. Ambos son "listo para que lo mire un
+# humano" para el semáforo y la cola de revisión -- un episodio sin pares
+# que analizar (una sola pista de audio, sin candidatos) se queda en
+# 'analizado' para siempre y así sigue siendo revisable igualmente.
 REVIEW_ELIGIBLE_STATUSES = {"analizado", "pendiente_revision"}
 
 SEMAPHORE_COLORS = {
@@ -50,12 +51,26 @@ SEMAPHORE_COLORS = {
 }
 
 
+def _ensure_column(engine: Engine, table: str, column: str, coltype: str) -> None:
+    """Migración aditiva mínima: ``Base.metadata.create_all`` crea tablas
+    nuevas pero no agrega columnas a tablas ya existentes. Sin esto, una DB
+    de una instalación anterior a que existiera ``reference_language``
+    rompería con un ``OperationalError`` en vez de simplemente ganar la
+    columna con valores ``NULL``."""
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        if column not in existing:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+            conn.commit()
+
+
 def create_db_engine(db_path: Path) -> Engine:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
         f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(engine)
+    _ensure_column(engine, "series", "reference_language", "TEXT")
     return engine
 
 
@@ -402,6 +417,57 @@ def list_problem_episodes(session: Session) -> list[Episode]:
         .order_by(Episode.number)
     )
     return list(session.execute(stmt).unique().scalars().all())
+
+
+# --- análisis de sincronización ------------------------------------------------
+
+
+def list_episodes_needing_analysis(session: Session) -> list[Episode]:
+    """Episodios recién probados que todavía no pasaron por el analizador."""
+    stmt = (
+        select(Episode)
+        .where(Episode.status == "analizado", Episode.missing.is_(False))
+        .options(
+            selectinload(Episode.tracks),
+            selectinload(Episode.season).selectinload(Season.series),
+        )
+        .order_by(Episode.number)
+    )
+    return list(session.execute(stmt).unique().scalars().all())
+
+
+def save_analysis(
+    session: Session,
+    episode: Episode,
+    pair,
+    verdict: str,
+    confidence: float | None,
+    suggested_delay_ms: int | None,
+    suggested_resample_ratio: float | None,
+    windows_json: str,
+    source_hash: str,
+) -> Analysis:
+    analysis = Analysis(
+        episode_id=episode.id,
+        candidate_id=None,
+        pair_source=pair.pair_source,
+        ref_track_index=pair.ref_track_index,
+        cand_track_index=pair.cand_track_index,
+        windows_json=windows_json,
+        verdict=verdict,
+        suggested_delay_ms=suggested_delay_ms,
+        suggested_resample_ratio=suggested_resample_ratio,
+        confidence=confidence,
+        source_hash=source_hash,
+        analyzed_at=_dt.datetime.now(_dt.timezone.utc),
+    )
+    session.add(analysis)
+    return analysis
+
+
+def list_analyses_for_episode(session: Session, episode_id: int) -> list[Analysis]:
+    stmt = select(Analysis).where(Analysis.episode_id == episode_id).order_by(Analysis.analyzed_at.desc())
+    return list(session.execute(stmt).scalars().all())
 
 
 # --- jobs -----------------------------------------------------------------------

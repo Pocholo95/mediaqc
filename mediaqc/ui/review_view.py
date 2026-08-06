@@ -1,11 +1,11 @@
 """Vista 2 — Revisión de episodio (spec sección 6). La pantalla crítica:
 tiene que permitir juzgar un capítulo en menos de 30 segundos.
 
-Sin analizador todavía (fase 4): la tabla de ventanas muestra las 5
-posiciones de muestreo sin offset/score, y el delay arranca en 0 en vez de
-precargado con un valor sugerido — igual el usuario puede ajustarlo a oído
-en vivo contra el reproductor, que es el valor central de esta pantalla.
-El comando `mkvmerge` sugerido llega en la fase 5 (``core/suggestions.py``).
+La tabla de ventanas y el delay precargado muestran el resultado del
+analizador (fase 4) para el par (referencia, pista de audio elegida en el
+combo) — si esa pista todavía no se analizó, o es la propia referencia,
+quedan en blanco y el delay arranca en 0. El comando `mkvmerge` sugerido
+llega en la fase 5 (``core/suggestions.py``).
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mediaqc.core.analyzer.analyze import windows_from_json
 from mediaqc.core.analyzer.windows import window_positions_seconds
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Episode
@@ -63,6 +64,8 @@ class ReviewView(QWidget):
         self._marked_timestamp_ms: int | None = None
         self._window_positions: list[float] = []
         self._timeline_dragging = False
+        self._analyses_by_cand_index: dict[int, object] = {}
+        self._audio_ordinal_to_stream_index: dict[int, int] = {}
 
         self._build_ui()
         self._setup_shortcuts()
@@ -248,6 +251,12 @@ class ReviewView(QWidget):
             display_title = episode.tmdb_title or Path(episode.path).stem
             self.title_label.setText(f"{series_title} — T{season_no}E{episode.number} — {display_title} [{status_label}]")
 
+            self._analyses_by_cand_index = {}
+            for a in repo.list_analyses_for_episode(session, episode_id):
+                # ordenadas por analyzed_at desc: la primera que aparece por
+                # índice de candidato es la más reciente.
+                self._analyses_by_cand_index.setdefault(a.cand_track_index, a)
+
             self._populate_audio_tracks(episode)
             self._populate_subtitle_tracks(episode)
             self._populate_windows(episode.duration_s)
@@ -259,13 +268,6 @@ class ReviewView(QWidget):
             self.queue_label.setText(f"{self._queue_index + 1} / {len(self._queue)}")
         else:
             self.queue_label.setText("")
-
-        self.delay_slider.blockSignals(True)
-        self.delay_spin.blockSignals(True)
-        self.delay_slider.setValue(0)
-        self.delay_spin.setValue(0)
-        self.delay_slider.blockSignals(False)
-        self.delay_spin.blockSignals(False)
 
         self.play_pause_btn.setText("Pausar")
         self.timeline_slider.setRange(0, 0)
@@ -280,9 +282,14 @@ class ReviewView(QWidget):
             self.player.set_audio_track(self.audio_track_combo.currentData())
             self.player.set_subtitle_track(self.subtitle_track_combo.currentData())
 
+        # va después de load(): aplica el delay sugerido (si lo hay para la
+        # pista elegida) sobre el archivo ya cargado.
+        self._apply_analysis_for_ordinal(self.audio_track_combo.currentData())
+
     def _populate_audio_tracks(self, episode: Episode) -> None:
         self.audio_track_combo.blockSignals(True)
         self.audio_track_combo.clear()
+        self._audio_ordinal_to_stream_index = {}
         audio_tracks = sorted(
             (t for t in episode.tracks if t.type == "audio"),
             key=lambda t: t.stream_index if t.stream_index is not None else 0,
@@ -299,6 +306,7 @@ class ReviewView(QWidget):
             # numera `aid` para un demuxer estándar, no el stream_index de
             # ffprobe ni el track id de mkvmerge (trampa #1, aplica también acá).
             self.audio_track_combo.addItem(label, ordinal)
+            self._audio_ordinal_to_stream_index[ordinal] = t.stream_index
         if audio_tracks:
             self.audio_track_combo.setCurrentIndex(default_index)
         self.audio_track_combo.blockSignals(False)
@@ -336,6 +344,38 @@ class ReviewView(QWidget):
                 self.jump_buttons[i].setText(label)
                 self.jump_buttons[i].setEnabled(bool(duration_s))
 
+    def _apply_analysis_for_ordinal(self, ordinal: int | None) -> None:
+        """Muestra en la tabla de ventanas y precarga el delay con el
+        resultado del analizador para el par (referencia, pista elegida) --
+        si esa pista es la propia referencia, o todavía no se analizó, no
+        hay nada que mostrar y el delay vuelve a 0 (spec: el usuario igual
+        puede ajustarlo a oído)."""
+        stream_index = self._audio_ordinal_to_stream_index.get(ordinal) if ordinal is not None else None
+        analysis = self._analyses_by_cand_index.get(stream_index) if stream_index is not None else None
+
+        if analysis is not None:
+            windows = windows_from_json(analysis.windows_json)
+            for i, w in enumerate(windows):
+                if i >= self.windows_table.rowCount():
+                    break
+                self.windows_table.setItem(i, 1, QTableWidgetItem(f"{w['offset_ms']:.0f} ms"))
+                self.windows_table.setItem(i, 2, QTableWidgetItem(f"{w['score']:.1f}"))
+            delay_value = max(-5000, min(5000, analysis.suggested_delay_ms or 0))
+        else:
+            for i in range(self.windows_table.rowCount()):
+                self.windows_table.setItem(i, 1, QTableWidgetItem("—"))
+                self.windows_table.setItem(i, 2, QTableWidgetItem("—"))
+            delay_value = 0
+
+        self.delay_slider.blockSignals(True)
+        self.delay_spin.blockSignals(True)
+        self.delay_slider.setValue(delay_value)
+        self.delay_spin.setValue(delay_value)
+        self.delay_slider.blockSignals(False)
+        self.delay_spin.blockSignals(False)
+        if self.player is not None:
+            self.player.set_audio_delay(delay_value / 1000.0)
+
     def _populate_history(self, session, episode_id: int) -> None:
         self.history_list.clear()
         reviews = repo.list_episode_reviews(session, episode_id)
@@ -356,11 +396,12 @@ class ReviewView(QWidget):
         self.player.seek_absolute(self._window_positions[index])
 
     def _on_audio_track_changed(self, index: int) -> None:
-        if self.player is None or index < 0:
+        if index < 0:
             return
         ordinal = self.audio_track_combo.itemData(index)
-        if ordinal is not None:
+        if self.player is not None and ordinal is not None:
             self.player.set_audio_track(ordinal)
+        self._apply_analysis_for_ordinal(ordinal)
 
     def _on_subtitle_track_changed(self, index: int) -> None:
         if self.player is None or index < 0:

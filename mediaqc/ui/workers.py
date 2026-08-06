@@ -13,7 +13,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
+from mediaqc.core import pairs as pairs_module
 from mediaqc.core import probe, scanner, tmdb
+from mediaqc.core.analyzer import analyze, correlate
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Episode, Job, Series
 
@@ -267,3 +269,128 @@ class TmdbApplyWorker(QRunnable):
         except Exception as exc:
             logger.exception("tmdb apply worker failed")
             self.signals.error.emit(str(exc))
+
+
+class AnalyzeWorker(QRunnable):
+    """Corre el analizador de sincronización (spec sección 5.5) sobre los
+    episodios recién probados. Un episodio sin pares que analizar (una sola
+    pista de audio, sin candidatos) no es un error: se salta y queda en
+    'analizado' tal cual."""
+
+    def __init__(
+        self,
+        session_factory,
+        ffmpeg_bin: Path | None,
+        audio_cache_dir: Path,
+        window_seconds: int,
+        sample_rate: int,
+        tmdb_client_factory,
+        audio_cache_limit_gb: float = 5.0,
+    ) -> None:
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.session_factory = session_factory
+        self.ffmpeg_bin = ffmpeg_bin
+        self.audio_cache_dir = audio_cache_dir
+        self.window_seconds = window_seconds
+        self.sample_rate = sample_rate
+        self.tmdb_client_factory = tmdb_client_factory
+        self.audio_cache_limit_gb = audio_cache_limit_gb
+        self._cancel_event = threading.Event()
+        self.setAutoDelete(True)
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as exc:
+            logger.exception("analyze worker failed")
+            self.signals.error.emit(str(exc))
+
+    def _run(self) -> None:
+        if self.ffmpeg_bin is None:
+            self.signals.error.emit(
+                "No se encontró ffmpeg. Configuralo en Preferencias para poder analizar."
+            )
+            return
+
+        with self.session_factory() as session:
+            episode_ids = [e.id for e in repo.list_episodes_needing_analysis(session)]
+
+        total = len(episode_ids)
+        if total == 0:
+            self.signals.finished.emit({"analyzed": 0, "no_pairs": 0, "errors": 0, "total": 0})
+            return
+
+        analyzed = no_pairs = errors = 0
+
+        with self.tmdb_client_factory() as client:
+            for i, episode_id in enumerate(episode_ids, start=1):
+                if self._cancel_event.is_set():
+                    break
+
+                with self.session_factory() as session:
+                    episode = session.get(Episode, episode_id)
+                    if episode is None or episode.missing:
+                        continue
+
+                    series = episode.season.series if episode.season else None
+                    if series is not None and client.enabled:
+                        tmdb.ensure_reference_language(session, client, series)
+
+                    reference_language = series.reference_language if series else None
+                    ep_pairs = pairs_module.generate_internal_pairs(episode, reference_language)
+
+                    if not ep_pairs:
+                        no_pairs += 1
+                        session.commit()
+                        continue
+
+                    self.signals.progress.emit(f"Analizando: {Path(episode.path).name}", i, total)
+
+                    had_error = False
+                    for pair in ep_pairs:
+                        try:
+                            result = analyze.analyze_pair(
+                                self.ffmpeg_bin,
+                                Path(episode.path),
+                                episode.file_hash or "",
+                                pair.ref_track_index,
+                                pair.cand_track_index,
+                                episode.duration_s or 0.0,
+                                self.window_seconds,
+                                self.sample_rate,
+                                self.audio_cache_dir,
+                            )
+                        except Exception as exc:
+                            logger.warning("análisis falló para %s: %s", episode.path, exc)
+                            had_error = True
+                            continue
+
+                        windows_json = analyze.windows_to_json(result.windows)
+                        repo.save_analysis(
+                            session,
+                            episode,
+                            pair,
+                            verdict=result.classification.verdict,
+                            confidence=result.classification.confidence,
+                            suggested_delay_ms=result.classification.suggested_delay_ms,
+                            suggested_resample_ratio=result.classification.suggested_resample_ratio,
+                            windows_json=windows_json,
+                            source_hash=episode.file_hash or "",
+                        )
+
+                    episode.status = "pendiente_revision"
+                    session.commit()
+
+                    if had_error:
+                        errors += 1
+                    else:
+                        analyzed += 1
+
+        limit_bytes = int(self.audio_cache_limit_gb * 1024**3)
+        correlate.purge_audio_cache(self.audio_cache_dir, limit_bytes)
+
+        self.signals.finished.emit({"analyzed": analyzed, "no_pairs": no_pairs, "errors": errors, "total": total})

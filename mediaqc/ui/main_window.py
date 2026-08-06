@@ -29,7 +29,14 @@ from PySide6.QtWidgets import (
 )
 
 from mediaqc.core import tmdb, tools
-from mediaqc.core.config import Config, ConfigError, get_logs_dir, get_tmdb_cache_dir, save_config
+from mediaqc.core.config import (
+    Config,
+    ConfigError,
+    get_audio_cache_dir,
+    get_logs_dir,
+    get_tmdb_cache_dir,
+    save_config,
+)
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Series
 from mediaqc.ui.library_view import LibraryView
@@ -38,7 +45,7 @@ from mediaqc.ui.review_view import ReviewView
 from mediaqc.ui.settings_dialog import SettingsDialog
 from mediaqc.ui.theme import apply_theme
 from mediaqc.ui.tmdb_dialog import TmdbMatchDialog
-from mediaqc.ui.workers import ScanWorker, TmdbApplyWorker, TmdbSearchWorker, TmdbSyncWorker
+from mediaqc.ui.workers import AnalyzeWorker, ScanWorker, TmdbApplyWorker, TmdbSearchWorker, TmdbSyncWorker
 
 
 class MainWindow(QMainWindow):
@@ -50,6 +57,7 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self._current_worker: ScanWorker | None = None
         self._current_tmdb_worker: TmdbSyncWorker | None = None
+        self._current_analyze_worker: AnalyzeWorker | None = None
         self._last_unparseable: list[str] = []
 
         self.setWindowTitle("MediaQC")
@@ -155,6 +163,10 @@ class MainWindow(QMainWindow):
         start_review_action = review_menu.addAction("Empezar a revisar (selección actual)")
         start_review_action.setShortcut("Ctrl+R")
         start_review_action.triggered.connect(self._start_review_from_selection)
+
+        analysis_menu = self.menuBar().addMenu("&Análisis")
+        self.analyze_action = analysis_menu.addAction("Analizar sincronización (episodios pendientes)")
+        self.analyze_action.triggered.connect(self._start_analyze)
 
     def _toggle_dark_mode(self, checked: bool) -> None:
         self.config.dark_mode = checked
@@ -320,6 +332,8 @@ class MainWindow(QMainWindow):
             self._current_worker.cancel()
         if self._current_tmdb_worker is not None:
             self._current_tmdb_worker.cancel()
+        if self._current_analyze_worker is not None:
+            self._current_analyze_worker.cancel()
         self.status_label.setText("Cancelando...")
 
     def _on_scan_progress(self, message: str, current: int, total: int) -> None:
@@ -499,6 +513,62 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(_on_error)
         self.thread_pool.start(worker)
 
+    # --- análisis de sincronización ---------------------------------------
+
+    def _start_analyze(self) -> None:
+        if self._current_analyze_worker is not None:
+            return
+
+        worker = AnalyzeWorker(
+            self.session_factory,
+            self.tool_paths.ffmpeg,
+            get_audio_cache_dir(),
+            self.config.window_seconds,
+            self.config.sample_rate,
+            self._make_tmdb_client,
+            audio_cache_limit_gb=self.config.audio_cache_limit_gb,
+        )
+        worker.signals.progress.connect(self._on_scan_progress)
+        worker.signals.finished.connect(self._on_analyze_finished)
+        worker.signals.error.connect(self._on_analyze_error)
+        self._current_analyze_worker = worker
+
+        self.analyze_action.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.cancel_button.setVisible(True)
+        self.status_label.setText("Analizando sincronización...")
+
+        self.thread_pool.start(worker)
+
+    def _on_analyze_finished(self, summary: dict) -> None:
+        self._current_analyze_worker = None
+        self.analyze_action.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+
+        if summary.get("total", 0) == 0:
+            self.status_label.setText("Análisis: no había episodios pendientes.")
+        else:
+            msg = (
+                f"Análisis: {summary['analyzed']} episodios analizados, "
+                f"{summary['no_pairs']} sin pistas para comparar."
+            )
+            if summary.get("errors"):
+                msg += f" {summary['errors']} con errores."
+            self.status_label.setText(msg)
+
+        self.library_view.refresh()
+        self.problems_view.refresh()
+
+    def _on_analyze_error(self, message: str) -> None:
+        self._current_analyze_worker = None
+        self.analyze_action.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.status_label.setText("Error en el análisis.")
+        QMessageBox.critical(self, "Error de análisis", message)
+
     # --- preferencias / jobs pendientes --------------------------------
 
     def _open_settings(self) -> None:
@@ -524,5 +594,7 @@ class MainWindow(QMainWindow):
             self._current_worker.cancel()
         if self._current_tmdb_worker is not None:
             self._current_tmdb_worker.cancel()
+        if self._current_analyze_worker is not None:
+            self._current_analyze_worker.cancel()
         self.review_view.terminate_player()
         super().closeEvent(event)

@@ -40,6 +40,9 @@ class Series(Base):
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tmdb_status: Mapped[str | None] = mapped_column(String, nullable=True)  # unmatched|auto|manual|skipped
     poster_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Idioma de la pista de referencia (spec 5.3b): auto-poblado desde el
+    # original_language de TMDB al aplicar un match; sobrescribible.
+    reference_language: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[_dt.datetime] = mapped_column(DateTime, default=_now)
 
     seasons: Mapped[list["Season"]] = relationship(
