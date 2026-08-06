@@ -1,24 +1,26 @@
 """Vista 2 — Revisión de episodio (spec sección 6). La pantalla crítica:
 tiene que permitir juzgar un capítulo en menos de 30 segundos.
 
-La tabla de ventanas y el delay precargado muestran el resultado del
-analizador (fase 4) para el par (referencia, pista de audio elegida en el
-combo) — si esa pista todavía no se analizó, o es la propia referencia,
-quedan en blanco y el delay arranca en 0. El comando `mkvmerge` sugerido
-llega en la fase 5 (``core/suggestions.py``).
+La tabla de ventanas, el delay precargado y el comando sugerido muestran el
+resultado del analizador (fase 4) para el par (referencia, pista de audio
+elegida en el combo) — si esa pista todavía no se analizó, o es la propia
+referencia, quedan en blanco.
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
@@ -30,10 +32,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mediaqc.core import suggestions as suggestions_module
 from mediaqc.core.analyzer.analyze import windows_from_json
 from mediaqc.core.analyzer.windows import window_positions_seconds
+from mediaqc.core.config import Config
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Candidate, Episode
+from mediaqc.core.tools import ToolPaths
 from mediaqc.ui.library_view import STATUS_LABELS
 from mediaqc.ui.player import MpvInitError, MpvPlayerWidget
 
@@ -55,9 +60,11 @@ class ReviewView(QWidget):
     verdict_recorded = Signal(int)  # episode_id, para que MainWindow refresque el semáforo
     queue_exhausted = Signal()
 
-    def __init__(self, session_factory, parent=None) -> None:
+    def __init__(self, session_factory, config: Config, tool_paths: ToolPaths, parent=None) -> None:
         super().__init__(parent)
         self.session_factory = session_factory
+        self.config = config
+        self.tool_paths = tool_paths
         self._queue: list[int] = []
         self._queue_index: int = -1
         self._episode_id: int | None = None
@@ -66,6 +73,9 @@ class ReviewView(QWidget):
         self._timeline_dragging = False
         self._analyses_by_cand_index: dict[int, object] = {}
         self._audio_ordinal_to_stream_index: dict[int, int] = {}
+        self._track_info_by_stream_index: dict[int, dict] = {}
+        self._episode_path: str | None = None
+        self._current_command_text: str = ""
 
         self._build_ui()
         self._setup_shortcuts()
@@ -196,6 +206,20 @@ class ReviewView(QWidget):
         self.windows_table.verticalHeader().setVisible(False)
         layout.addWidget(self.windows_table)
 
+        command_bar = QHBoxLayout()
+        command_bar.addWidget(QLabel("Comando sugerido:"))
+        self.command_edit = QLineEdit()
+        self.command_edit.setReadOnly(True)
+        command_bar.addWidget(self.command_edit, 1)
+        self.copy_command_btn = QPushButton("Copiar")
+        self.copy_command_btn.clicked.connect(self._copy_command)
+        command_bar.addWidget(self.copy_command_btn)
+        layout.addLayout(command_bar)
+        self.command_warning_label = QLabel("")
+        self.command_warning_label.setWordWrap(True)
+        self.command_warning_label.setStyleSheet("color: #c07000;")
+        layout.addWidget(self.command_warning_label)
+
         verdict_bar = QHBoxLayout()
         self.verdict_buttons: dict[str, QPushButton] = {}
         for key, verdict, label in _VERDICT_SHORTCUTS:
@@ -277,6 +301,18 @@ class ReviewView(QWidget):
                 # ordenadas por analyzed_at desc: la primera que aparece por
                 # índice de candidato es la más reciente.
                 self._analyses_by_cand_index.setdefault(a.cand_track_index, a)
+
+            self._track_info_by_stream_index = {
+                t.stream_index: {
+                    "mkv_track_id": t.mkv_track_id,
+                    "container_delay_ms": t.container_delay_ms,
+                    "language": t.language,
+                    "title": t.title,
+                }
+                for t in episode.tracks
+                if t.stream_index is not None
+            }
+            self._episode_path = episode.path
 
             self._populate_audio_tracks(episode)
             self._populate_subtitle_tracks(episode)
@@ -470,6 +506,54 @@ class ReviewView(QWidget):
         self.delay_spin.blockSignals(False)
         if self.player is not None:
             self.player.set_audio_delay(delay_value / 1000.0)
+
+        self._update_suggested_command(analysis)
+
+    def _update_suggested_command(self, analysis) -> None:
+        self._current_command_text = ""
+
+        if analysis is None or not self._episode_path:
+            self.command_edit.setText("")
+            self.command_warning_label.setText("")
+            return
+
+        output_dir = self.config.output_dir
+        if not output_dir:
+            self.command_edit.setText("")
+            self.command_warning_label.setText("Configurá una carpeta de salida en Preferencias para armar el comando.")
+            return
+
+        cand_info = self._track_info_by_stream_index.get(analysis.cand_track_index, {})
+
+        suggestion = suggestions_module.suggest_for_analysis(
+            verdict=analysis.verdict,
+            pair_source=analysis.pair_source,
+            suggested_delay_ms=analysis.suggested_delay_ms,
+            suggested_resample_ratio=analysis.suggested_resample_ratio,
+            mkv_track_id=cand_info.get("mkv_track_id"),
+            episode_path=self._episode_path,
+            output_filename=Path(self._episode_path).name,
+            output_dir=output_dir,
+            mkvmerge_bin=str(self.tool_paths.mkvmerge) if self.tool_paths.mkvmerge else None,
+            ffmpeg_bin=str(self.tool_paths.ffmpeg) if self.tool_paths.ffmpeg else None,
+        )
+
+        platform = "windows" if sys.platform == "win32" else "linux"
+        if suggestion.commands:
+            self._current_command_text = suggestions_module.format_command(suggestion.commands[0], platform=platform)
+        self.command_edit.setText(self._current_command_text)
+
+        parts = [suggestion.summary]
+        if suggestion.warning:
+            parts.append(suggestion.warning)
+        self.command_warning_label.setText(" — ".join(parts))
+
+    def _copy_command(self) -> None:
+        if not self._current_command_text:
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(self._current_command_text)
 
     def _populate_history(self, session, episode_id: int) -> None:
         self.history_list.clear()

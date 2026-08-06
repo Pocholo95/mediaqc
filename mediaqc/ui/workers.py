@@ -38,6 +38,7 @@ class ScanWorker(QRunnable):
         media_paths: list[str],
         ffprobe_bin: Path | None,
         mkvmerge_bin: Path | None,
+        force_reprobe: bool = False,
     ) -> None:
         super().__init__()
         self.signals = WorkerSignals()
@@ -45,6 +46,11 @@ class ScanWorker(QRunnable):
         self.media_paths = media_paths
         self.ffprobe_bin = ffprobe_bin
         self.mkvmerge_bin = mkvmerge_bin
+        # fuerza re-probe de TODO lo encontrado, no solo lo que cambió de
+        # hash -- para cuando un binario (típicamente mkvmerge) se instala
+        # o se configura después del escaneo original y hay que recuperar
+        # los datos que dependen de él (mkv_track_id) sin tocar los archivos.
+        self.force_reprobe = force_reprobe
         self._cancel_event = threading.Event()
         self.setAutoDelete(True)
 
@@ -88,7 +94,7 @@ class ScanWorker(QRunnable):
                 )
                 session.commit()
 
-            changed_ids = stats["changed_episode_ids"]
+            changed_ids = stats["all_episode_ids"] if self.force_reprobe else stats["changed_episode_ids"]
             total = len(changed_ids)
             probe_errors = 0
 
@@ -351,7 +357,9 @@ class AnalyzeWorker(QRunnable):
 
                     self.signals.progress.emit(f"Analizando: {Path(episode.path).name}", i, total)
 
+                    was_problema = repo.latest_review_was_problema(session, episode.id)
                     had_error = False
+                    verdicts: list[str] = []
                     for pair in ep_pairs:
                         try:
                             result = analyze.analyze_pair(
@@ -370,6 +378,7 @@ class AnalyzeWorker(QRunnable):
                             had_error = True
                             continue
 
+                        verdicts.append(result.classification.verdict)
                         windows_json = analyze.windows_to_json(result.windows)
                         repo.save_analysis(
                             session,
@@ -383,7 +392,15 @@ class AnalyzeWorker(QRunnable):
                             source_hash=episode.file_hash or "",
                         )
 
-                    episode.status = "pendiente_revision"
+                    # cierre del ciclo (spec sección 8, fase 5): si venía de
+                    # 'problema' y el usuario ya lo muxeó por fuera, un
+                    # re-análisis que ahora da todo ok pasa a 'corregido' --
+                    # no a 'aprobado' directo, eso lo sigue otorgando solo
+                    # una review humana (trampa #10).
+                    if was_problema and verdicts and all(v == "ok" for v in verdicts):
+                        episode.status = "corregido"
+                    else:
+                        episode.status = "pendiente_revision"
                     session.commit()
 
                     if had_error:

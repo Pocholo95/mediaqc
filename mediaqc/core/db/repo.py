@@ -36,11 +36,14 @@ VALID_VERDICTS = {
 
 # "analizado": recién probado, todavía no pasó por el analizador de audio.
 # "pendiente_revision": ya tiene un veredicto automático (AnalyzeWorker)
-# esperando confirmación humana. Ambos son "listo para que lo mire un
+# esperando confirmación humana. "corregido": estaba en 'problema', el
+# usuario lo muxeó por fuera, y un re-análisis dio offset ok -- pero sigue
+# necesitando que un humano lo confirme para pasar a 'aprobado' (trap #10,
+# el analizador nunca aprueba solo). Los tres son "listo para que lo mire un
 # humano" para el semáforo y la cola de revisión -- un episodio sin pares
 # que analizar (una sola pista de audio, sin candidatos) se queda en
 # 'analizado' para siempre y así sigue siendo revisable igualmente.
-REVIEW_ELIGIBLE_STATUSES = {"analizado", "pendiente_revision"}
+REVIEW_ELIGIBLE_STATUSES = {"analizado", "pendiente_revision", "corregido"}
 
 SEMAPHORE_COLORS = {
     "sin_analizar": "gray",
@@ -159,6 +162,7 @@ def apply_scan_result(session: Session, scan_result: ScanResult) -> dict:
     marcado de ausentes. Nunca borra filas de ``episodes`` (spec sección 5.1)."""
     seen_paths: set[str] = set()
     changed_episode_ids: list[int] = []
+    all_episode_ids: list[int] = []
     new_count = 0
 
     for scanned_series in scan_result.series:
@@ -179,6 +183,7 @@ def apply_scan_result(session: Session, scan_result: ScanResult) -> dict:
 
             episode, changed = upsert_episode(session, season_id, scanned_ep)
             seen_paths.add(str(scanned_ep.path))
+            all_episode_ids.append(episode.id)
             if changed:
                 changed_episode_ids.append(episode.id)
                 new_count += 1
@@ -188,6 +193,7 @@ def apply_scan_result(session: Session, scan_result: ScanResult) -> dict:
     return {
         "seen_paths": seen_paths,
         "changed_episode_ids": changed_episode_ids,
+        "all_episode_ids": all_episode_ids,
         "changed_count": new_count,
         "removed_empty_series": removed_empty_series,
     }
@@ -390,6 +396,18 @@ def list_episode_reviews(session: Session, episode_id: int) -> list[Review]:
     return list(session.execute(stmt).scalars().all())
 
 
+def latest_review_was_problema(session: Session, episode_id: int) -> bool:
+    """A diferencia de ``episode.status`` (que un re-escaneo ya pisó a
+    'sin_analizar'/'analizado' antes de que el analizador vuelva a correr),
+    el historial de reviews no se toca: sirve para saber si la última vez
+    que un humano miró este episodio lo marcó como problema, y así detectar
+    el cierre del ciclo (spec sección 8, fase 5) aunque el status transitorio
+    ya haya cambiado."""
+    stmt = select(Review.verdict).where(Review.episode_id == episode_id).order_by(Review.created_at.desc()).limit(1)
+    verdict = session.execute(stmt).scalar_one_or_none()
+    return verdict is not None and verdict != "ok"
+
+
 def list_review_queue(session: Session, season_id: int | None = None) -> list[Episode]:
     """Episodios listos para que un humano los revise (Vista 2)."""
     stmt = (
@@ -469,6 +487,31 @@ def save_analysis(
 def list_analyses_for_episode(session: Session, episode_id: int) -> list[Analysis]:
     stmt = select(Analysis).where(Analysis.episode_id == episode_id).order_by(Analysis.analyzed_at.desc())
     return list(session.execute(stmt).scalars().all())
+
+
+def get_latest_analysis_with_tracks(
+    session: Session, episode: Episode
+) -> tuple[Analysis | None, Track | None, Track | None]:
+    """La ``Analysis`` más reciente del episodio, con sus ``Track`` de
+    referencia y candidato ya resueltos por ``stream_index`` — lo que
+    necesita ``core/suggestions.py`` para armar el comando."""
+    stmt = select(Analysis).where(Analysis.episode_id == episode.id).order_by(Analysis.analyzed_at.desc())
+    analysis = session.execute(stmt).scalars().first()
+    if analysis is None:
+        return None, None, None
+    ref_track = next((t for t in episode.tracks if t.stream_index == analysis.ref_track_index), None)
+    cand_track = next((t for t in episode.tracks if t.stream_index == analysis.cand_track_index), None)
+    return analysis, ref_track, cand_track
+
+
+def list_episodes_for_export(session: Session, season_id: int) -> list[Episode]:
+    stmt = (
+        select(Episode)
+        .where(Episode.season_id == season_id, Episode.missing.is_(False))
+        .options(selectinload(Episode.tracks))
+        .order_by(Episode.number)
+    )
+    return list(session.execute(stmt).unique().scalars().all())
 
 
 # --- candidatos externos (modo externo, spec 5.3) ------------------------------

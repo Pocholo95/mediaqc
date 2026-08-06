@@ -118,6 +118,33 @@ def test_rescan_reparents_episodes_and_cleans_up_ghost_series(tmp_path):
     assert seasons == {1, 2}
 
 
+def test_apply_scan_result_all_episode_ids_includes_unchanged(tmp_path):
+    # force_reprobe (spec fase 5: recuperar mkv_track_id tras instalar
+    # mkvmerge tarde) necesita poder re-probar TODO lo encontrado, no solo
+    # lo que cambió de hash -- por eso all_episode_ids existe aparte de
+    # changed_episode_ids.
+    engine = create_db_engine(tmp_path / "mediaqc.db")
+    session_factory = make_session_factory(engine)
+    ep_path = tmp_path / "Serie" / "01.mkv"
+    scan = ScanResult(
+        series=[ScannedSeries(path=tmp_path / "Serie", folder_name="Serie", title="Serie", year=None, episodes=[_episode(ep_path, season=1, number=1)])]
+    )
+
+    with session_factory() as session:
+        stats = apply_scan_result(session, scan)
+        session.commit()
+        first_episode_id = stats["all_episode_ids"][0]
+    assert stats["changed_episode_ids"] == [first_episode_id]
+
+    # mismo escaneo de nuevo, nada cambió en disco
+    with session_factory() as session:
+        stats2 = apply_scan_result(session, scan)
+        session.commit()
+
+    assert stats2["changed_episode_ids"] == []  # no hay nada "nuevo" para re-probar
+    assert stats2["all_episode_ids"] == [first_episode_id]  # pero sigue ahí para forzar
+
+
 def _seed_one_episode(tmp_path, status: str = "analizado", missing: bool = False) -> tuple[object, int]:
     engine = create_db_engine(tmp_path / "mediaqc.db")
     session_factory = make_session_factory(engine)

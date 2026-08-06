@@ -6,12 +6,16 @@ los jobs.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 from PySide6.QtCore import QUrl, Qt, QThreadPool
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -28,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mediaqc.core import suggestions as suggestions_module
 from mediaqc.core import tmdb, tools
 from mediaqc.core.config import (
     Config,
@@ -104,7 +109,7 @@ class MainWindow(QMainWindow):
         self.library_view.episode_activated.connect(self._open_review_from_library)
         self.view_tabs.addTab(self.library_view, "Biblioteca")
 
-        self.review_view = ReviewView(self.session_factory)
+        self.review_view = ReviewView(self.session_factory, self.config, self.tool_paths)
         self.review_view.verdict_recorded.connect(self._on_verdict_recorded)
         self.review_view.queue_exhausted.connect(self._on_review_queue_exhausted)
         self.view_tabs.addTab(self.review_view, "Revisión")
@@ -142,6 +147,9 @@ class MainWindow(QMainWindow):
 
         self.scan_action = menu.addAction("Escanear biblioteca")
         self.scan_action.triggered.connect(self._start_scan)
+
+        self.force_reprobe_action = menu.addAction("Forzar re-análisis técnico de toda la biblioteca")
+        self.force_reprobe_action.triggered.connect(self._start_force_reprobe)
 
         self.candidates_scan_action = menu.addAction("Escanear candidatos externos")
         self.candidates_scan_action.triggered.connect(self._start_candidates_scan)
@@ -237,12 +245,19 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         scope = item.data(0, Qt.UserRole)
-        if scope is None or scope[0] != "series":
+        if scope is None:
             return
+
         menu = QMenu(self)
-        action = menu.addAction("Resolver TMDB...")
-        action.triggered.connect(lambda: self._resolve_tmdb_for_series(scope[1]))
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if scope[0] == "series":
+            action = menu.addAction("Resolver TMDB...")
+            action.triggered.connect(lambda: self._resolve_tmdb_for_series(scope[1]))
+        elif scope[0] == "season":
+            action = menu.addAction("Exportar script de la temporada...")
+            action.triggered.connect(lambda: self._export_season_script(scope[1]))
+
+        if not menu.isEmpty():
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _selected_scope(self) -> tuple[str, int] | None:
         items = self.tree.selectedItems()
@@ -308,7 +323,7 @@ class MainWindow(QMainWindow):
 
     # --- escaneo -------------------------------------------------------
 
-    def _start_scan(self) -> None:
+    def _start_scan(self, force_reprobe: bool = False) -> None:
         if not self.config.media_paths:
             QMessageBox.warning(
                 self,
@@ -324,6 +339,7 @@ class MainWindow(QMainWindow):
             self.config.media_paths,
             self.tool_paths.ffprobe,
             self.tool_paths.mkvmerge,
+            force_reprobe=force_reprobe,
         )
         worker.signals.progress.connect(self._on_scan_progress)
         worker.signals.finished.connect(self._on_scan_finished)
@@ -331,12 +347,29 @@ class MainWindow(QMainWindow):
         self._current_worker = worker
 
         self.scan_action.setEnabled(False)
+        self.force_reprobe_action.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.cancel_button.setVisible(True)
-        self.status_label.setText("Escaneando...")
+        self.status_label.setText("Re-analizando toda la biblioteca..." if force_reprobe else "Escaneando...")
 
         self.thread_pool.start(worker)
+
+    def _start_force_reprobe(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Forzar re-análisis técnico",
+            "Vuelve a correr ffprobe/mkvmerge sobre TODOS los episodios, aunque no hayan "
+            "cambiado en disco. Usalo después de instalar o configurar mkvmerge/ffmpeg más "
+            "tarde, para recuperar los datos que dependen de ellos (como el ID de pista de "
+            "mkvmerge que necesitan los comandos sugeridos).\n\n"
+            "Ojo: episodios ya aprobados o marcados como corregidos vuelven a 'analizado' "
+            "(el historial de reviews no se pierde, pero hay que volver a confirmarlos). "
+            "No modifica ningún archivo de la librería.\n\n"
+            "¿Continuar?",
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_scan(force_reprobe=True)
 
     def _cancel_current_worker(self) -> None:
         if self._current_worker is not None:
@@ -360,6 +393,7 @@ class MainWindow(QMainWindow):
     def _on_scan_finished(self, summary: dict) -> None:
         self._current_worker = None
         self.scan_action.setEnabled(True)
+        self.force_reprobe_action.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
         self._last_unparseable = summary.get("unparseable", [])
@@ -384,6 +418,7 @@ class MainWindow(QMainWindow):
     def _on_scan_error(self, message: str) -> None:
         self._current_worker = None
         self.scan_action.setEnabled(True)
+        self.force_reprobe_action.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
         self.status_label.setText("Error en el escaneo.")
@@ -638,6 +673,65 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Error escaneando candidatos.")
         QMessageBox.critical(self, "Error de candidatos", message)
 
+    # --- sugerencias / export de temporada --------------------------------
+
+    def _export_season_script(self, season_id: int) -> None:
+        if not self.config.output_dir:
+            QMessageBox.warning(
+                self,
+                "Sin carpeta de salida",
+                "Configurá una carpeta de salida en Preferencias antes de exportar.",
+            )
+            return
+
+        with self.session_factory() as session:
+            episodes = repo.list_episodes_for_export(session, season_id)
+            episode_suggestions = []
+            for ep in episodes:
+                analysis, _ref_track, cand_track = repo.get_latest_analysis_with_tracks(session, ep)
+                if analysis is None:
+                    continue
+                suggestion = suggestions_module.suggest_for_analysis(
+                    verdict=analysis.verdict,
+                    pair_source=analysis.pair_source,
+                    suggested_delay_ms=analysis.suggested_delay_ms,
+                    suggested_resample_ratio=analysis.suggested_resample_ratio,
+                    mkv_track_id=cand_track.mkv_track_id if cand_track else None,
+                    episode_path=ep.path,
+                    output_filename=Path(ep.path).name,
+                    output_dir=self.config.output_dir,
+                    mkvmerge_bin=str(self.tool_paths.mkvmerge) if self.tool_paths.mkvmerge else None,
+                    ffmpeg_bin=str(self.tool_paths.ffmpeg) if self.tool_paths.ffmpeg else None,
+                )
+                episode_suggestions.append((Path(ep.path).name, suggestion))
+
+        if not any(s.commands for _, s in episode_suggestions):
+            QMessageBox.information(
+                self,
+                "Nada para exportar",
+                "No hay episodios con comando sugerido en esta temporada "
+                "(todo ok, faltan analizar, o falta mkvmerge/ffmpeg).",
+            )
+            return
+
+        default_name = "script.bat" if sys.platform == "win32" else "script.sh"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Exportar script de la temporada", default_name, "Scripts (*.bat *.sh);;Todos los archivos (*)"
+        )
+        if not path_str:
+            return
+
+        platform = "windows" if path_str.lower().endswith(".bat") else "linux"
+        script_text = suggestions_module.build_season_export_script(episode_suggestions, platform=platform)
+
+        try:
+            Path(path_str).write_text(script_text, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
+            return
+
+        QMessageBox.information(self, "Exportado", f"Script guardado en:\n{path_str}")
+
     # --- preferencias / jobs pendientes --------------------------------
 
     def _open_settings(self) -> None:
@@ -648,6 +742,8 @@ class MainWindow(QMainWindow):
             self._on_language_filter_changed()
             self.tool_paths = tools.resolve_all(self.config.ffmpeg_path, self.config.mkvmerge_path)
             self._warn_missing_tools()
+            self.review_view.config = self.config
+            self.review_view.tool_paths = self.tool_paths
 
     def _check_pending_jobs(self) -> None:
         with self.session_factory() as session:
