@@ -287,14 +287,20 @@ class ReviewView(QWidget):
             (t for t in episode.tracks if t.type == "audio"),
             key=lambda t: t.stream_index if t.stream_index is not None else 0,
         )
+        default_index = 0  # si ninguna viene marcada default, la primera
         for ordinal, t in enumerate(audio_tracks, start=1):
             label = f"{t.language or 'und'} · {t.codec or '?'} · {t.channels or '?'}ch"
             if t.title:
                 label += f" · {t.title}"
+            if t.is_default:
+                label += " [default]"
+                default_index = ordinal - 1
             # ordinal 1-based dentro de las pistas de audio: es como mpv
             # numera `aid` para un demuxer estándar, no el stream_index de
             # ffprobe ni el track id de mkvmerge (trampa #1, aplica también acá).
             self.audio_track_combo.addItem(label, ordinal)
+        if audio_tracks:
+            self.audio_track_combo.setCurrentIndex(default_index)
         self.audio_track_combo.blockSignals(False)
 
     def _populate_subtitle_tracks(self, episode: Episode) -> None:
@@ -305,13 +311,18 @@ class ReviewView(QWidget):
             (t for t in episode.tracks if t.type == "subtitle"),
             key=lambda t: t.stream_index if t.stream_index is not None else 0,
         )
+        default_index = 0  # "Sin subtítulos" si ninguna pista viene marcada default
         for ordinal, t in enumerate(sub_tracks, start=1):
             label = t.language or "und"
             if t.is_forced:
                 label += " (forzado)"
             if t.title:
                 label += f" · {t.title}"
+            if t.is_default:
+                label += " [default]"
+                default_index = ordinal
             self.subtitle_track_combo.addItem(label, ordinal)
+        self.subtitle_track_combo.setCurrentIndex(default_index)
         self.subtitle_track_combo.blockSignals(False)
 
     def _populate_windows(self, duration_s: float | None) -> None:
