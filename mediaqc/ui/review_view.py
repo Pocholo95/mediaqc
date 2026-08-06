@@ -32,14 +32,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mediaqc.core import subtitles as subtitles_module
 from mediaqc.core import suggestions as suggestions_module
 from mediaqc.core.analyzer.analyze import windows_from_json
 from mediaqc.core.analyzer.windows import window_positions_seconds
-from mediaqc.core.config import Config
+from mediaqc.core.config import Config, get_data_dir
 from mediaqc.core.db import repo
 from mediaqc.core.db.models import Candidate, Episode
 from mediaqc.core.tools import ToolPaths
 from mediaqc.ui.library_view import STATUS_LABELS
+from mediaqc.ui.subtitle_viewer import SubtitleViewerDialog
 from mediaqc.ui.player import MpvInitError, MpvPlayerWidget
 
 _VERDICT_SHORTCUTS = [
@@ -73,8 +75,10 @@ class ReviewView(QWidget):
         self._timeline_dragging = False
         self._analyses_by_cand_index: dict[int, object] = {}
         self._audio_ordinal_to_stream_index: dict[int, int] = {}
+        self._subtitle_ordinal_to_stream_index: dict[int, int] = {}
         self._track_info_by_stream_index: dict[int, dict] = {}
         self._episode_path: str | None = None
+        self._subtitle_viewer: SubtitleViewerDialog | None = None
         self._current_command_text: str = ""
 
         self._build_ui()
@@ -159,6 +163,10 @@ class ReviewView(QWidget):
         self.subtitle_track_combo = QComboBox()
         self.subtitle_track_combo.currentIndexChanged.connect(self._on_subtitle_track_changed)
         subtitle_bar.addWidget(self.subtitle_track_combo, 1)
+        self.view_subtitles_btn = QPushButton("Ver subtítulos")
+        self.view_subtitles_btn.setEnabled(False)
+        self.view_subtitles_btn.clicked.connect(self._open_subtitle_viewer_internal)
+        subtitle_bar.addWidget(self.view_subtitles_btn)
         layout.addLayout(subtitle_bar)
 
         candidates_bar = QHBoxLayout()
@@ -171,6 +179,9 @@ class ReviewView(QWidget):
         self.reassign_candidate_btn = QPushButton("Reasignar...")
         self.reassign_candidate_btn.clicked.connect(self._reassign_selected_candidate)
         candidates_bar.addWidget(self.reassign_candidate_btn)
+        self.view_candidate_subtitles_btn = QPushButton("Ver subtítulos")
+        self.view_candidate_subtitles_btn.clicked.connect(self._open_subtitle_viewer_candidate)
+        candidates_bar.addWidget(self.view_candidate_subtitles_btn)
         layout.addLayout(candidates_bar)
 
         delay_bar = QHBoxLayout()
@@ -280,6 +291,10 @@ class ReviewView(QWidget):
         self._marked_timestamp_ms = None
         self.mark_label.setText("")
 
+        if self._subtitle_viewer is not None:
+            self._subtitle_viewer.close()
+            self._subtitle_viewer = None
+
         with self.session_factory() as session:
             episode = session.get(Episode, episode_id)
             if episode is None:
@@ -308,6 +323,7 @@ class ReviewView(QWidget):
                     "container_delay_ms": t.container_delay_ms,
                     "language": t.language,
                     "title": t.title,
+                    "codec": t.codec,
                 }
                 for t in episode.tracks
                 if t.stream_index is not None
@@ -381,6 +397,7 @@ class ReviewView(QWidget):
         self.subtitle_track_combo.blockSignals(True)
         self.subtitle_track_combo.clear()
         self.subtitle_track_combo.addItem("Sin subtítulos", None)
+        self._subtitle_ordinal_to_stream_index = {}
         sub_tracks = sorted(
             (t for t in episode.tracks if t.type == "subtitle"),
             key=lambda t: t.stream_index if t.stream_index is not None else 0,
@@ -396,7 +413,9 @@ class ReviewView(QWidget):
                 label += " [default]"
                 default_index = ordinal
             self.subtitle_track_combo.addItem(label, ordinal)
+            self._subtitle_ordinal_to_stream_index[ordinal] = t.stream_index
         self.subtitle_track_combo.setCurrentIndex(default_index)
+        self.view_subtitles_btn.setEnabled(default_index != 0)
         self.subtitle_track_combo.blockSignals(False)
 
     def _populate_candidates(self, session, episode_id: int) -> None:
@@ -463,6 +482,78 @@ class ReviewView(QWidget):
             session.commit()
 
         self.load_episode(self._episode_id)
+
+    def _open_subtitle_viewer_internal(self) -> None:
+        """Visor de verificación para la pista de subtítulo interna elegida
+        en el combo (spec: nunca edita, solo extrae a un archivo aparte
+        para poder mostrar el texto — la extracción no toca el original)."""
+        ordinal = self.subtitle_track_combo.currentData()
+        stream_index = self._subtitle_ordinal_to_stream_index.get(ordinal) if ordinal is not None else None
+        if stream_index is None or not self._episode_path:
+            return
+
+        track_info = self._track_info_by_stream_index.get(stream_index, {})
+        codec = track_info.get("codec")
+        if not subtitles_module.codec_supports_text_preview(codec):
+            QMessageBox.information(
+                self,
+                "No disponible",
+                f"La pista es un formato de imagen por cuadro ({codec or 'desconocido'}), no hay texto para mostrar.",
+            )
+            return
+        if not self.tool_paths.ffmpeg:
+            QMessageBox.warning(self, "Falta ffmpeg", "No se encontró ffmpeg para extraer la pista.")
+            return
+
+        try:
+            out_path = subtitles_module.extract_subtitle_track(
+                self.tool_paths.ffmpeg,
+                Path(self._episode_path),
+                stream_index,
+                codec,
+                get_data_dir() / "subtitle_preview",
+            )
+            cues = subtitles_module.parse_subtitle_file(out_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"No se pudo extraer o leer el subtítulo:\n{exc}")
+            return
+
+        label = track_info.get("language") or "und"
+        if track_info.get("title"):
+            label += f" · {track_info['title']}"
+        self._show_subtitle_viewer(label, cues)
+
+    def _open_subtitle_viewer_candidate(self) -> None:
+        candidate_id = self.candidates_combo.currentData()
+        if candidate_id is None:
+            return
+
+        with self.session_factory() as session:
+            candidate = session.get(Candidate, candidate_id)
+            if candidate is None:
+                return
+            path, kind = candidate.path, candidate.kind
+
+        if kind != "subtitle":
+            QMessageBox.information(self, "No es un subtítulo", "El candidato seleccionado no es un archivo de subtítulos.")
+            return
+
+        try:
+            cues = subtitles_module.parse_subtitle_file(Path(path))
+        except OSError as exc:
+            QMessageBox.critical(self, "Error", f"No se pudo leer el subtítulo:\n{exc}")
+            return
+
+        self._show_subtitle_viewer(f"candidato · {Path(path).name}", cues)
+
+    def _show_subtitle_viewer(self, label: str, cues: list) -> None:
+        if not cues:
+            QMessageBox.information(self, "Sin líneas", "No se encontraron líneas de subtítulo para mostrar.")
+            return
+        if self._subtitle_viewer is not None:
+            self._subtitle_viewer.close()
+        self._subtitle_viewer = SubtitleViewerDialog(label, cues, self.player, self)
+        self._subtitle_viewer.show()
 
     def _populate_windows(self, duration_s: float | None) -> None:
         self._window_positions = window_positions_seconds(duration_s or 0.0)
@@ -583,10 +674,12 @@ class ReviewView(QWidget):
         self._apply_analysis_for_ordinal(ordinal)
 
     def _on_subtitle_track_changed(self, index: int) -> None:
-        if self.player is None or index < 0:
+        if index < 0:
             return
         ordinal = self.subtitle_track_combo.itemData(index)
-        self.player.set_subtitle_track(ordinal)
+        self.view_subtitles_btn.setEnabled(ordinal is not None)
+        if self.player is not None:
+            self.player.set_subtitle_track(ordinal)
 
     def _toggle_pause(self) -> None:
         if self.player is None:
@@ -714,5 +807,8 @@ class ReviewView(QWidget):
 
     def terminate_player(self) -> None:
         self._position_timer.stop()
+        if self._subtitle_viewer is not None:
+            self._subtitle_viewer.close()
+            self._subtitle_viewer = None
         if self.player is not None:
             self.player.terminate()
